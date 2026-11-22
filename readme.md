@@ -4,9 +4,9 @@ apt-cyg
 apt-cyg is a Cygwin package manager. It includes a command-line installer for
 Cygwin which cooperates with Cygwin Setup and uses the same repository.
 
-[github.com/transcode-open/apt-cyg][1]
+[github.com/rccipriani/apt-cyg][1]
 
-[1]:https://github.com/transcode-open/apt-cyg
+[1]:https://github.com/rccipriani/apt-cyg
 
 Operations
 ----------
@@ -65,9 +65,39 @@ Quick start
 
 apt-cyg is a simple script. To install:
 
-    lynx -source rawgit.com/transcode-open/apt-cyg/master/apt-cyg > apt-cyg
-    install apt-cyg /bin
+    wget -O apt-cyg https://raw.githubusercontent.com/rccipriani/apt-cyg/master/apt-cyg
+    install -m 755 apt-cyg /bin/apt-cyg
 
 Example use of apt-cyg:
 
     apt-cyg install nano
+
+Dependency handling in this fork
+-------------------------------
+
+Installations read `depends2:` and `depends:` from the current stable version,
+with support for legacy `requires:` metadata. Modern metadata takes precedence,
+including an explicitly empty dependency list. Dependencies from previous or test
+versions are excluded. The `depends` and `rdepends` commands use the same stable
+package selection and display dependency names.
+
+Running `install` on an installed package checks its dependencies again. This
+allows a retry to install missing dependency packages after a partial installation.
+Existing package files are not reinstalled or upgraded. Missing files belonging
+to a package already registered as installed require repair with Cygwin Setup.
+
+Dependency and post-install failures return a nonzero exit status. Failed
+post-install scripts remain pending for a retry. A package can already have been
+extracted and registered when a dependency fails; rerun the same install command
+after correcting the failure.
+
+Version constraints and alternative dependency expressions require the official
+Cygwin Setup dependency solver. This fork stops with an explanatory error when
+it encounters them instead of silently installing an unchecked version. Virtual
+package providers are not resolved. `--nodeps` explicitly bypasses dependency
+handling, as in upstream apt-cyg.
+
+Regression tests use local fixture archives and a temporary installation root.
+Run them with Python 3 and Bash available:
+
+    python3 -m unittest discover -s tests -v

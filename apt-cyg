@@ -134,12 +134,11 @@ function find-workspace {
   
   # work wherever setup worked last, if possible
   cache=$(awk '
-  BEGIN {
-    RS = "\n\\<"
-    FS = "\n\t"
-  }
-  $1 == "last-cache" {
-    print $2
+  $0 == "last-cache" {
+    getline
+    sub(/^\t/, "")
+    print
+    exit
   }
   ' /etc/setup/setup.rc)
 
@@ -161,7 +160,6 @@ function find-workspace {
     return 0
   else
     get-setup
-    return 1
   fi
 }
 
@@ -177,6 +175,7 @@ function get-setup {
   else
     echo Error updating setup.ini, reverting
     mv setup.ini-save setup.ini
+    return 1
   fi
 }
 
@@ -273,19 +272,99 @@ function apt-show {
   done
 }
 
+# Select package-wide metadata and the preferred stable version only.
+function package-description {
+  awk -v package="$1" '
+  function flush() {
+    if (active) printf "%s%s", header, current
+  }
+  /^@ / {
+    flush()
+    active = (package == "" || $2 == package)
+    header = $0 "\n"
+    current = ""
+    version_seen = 0
+    selected = 1
+    next
+  }
+  !active { next }
+  /^\[/ {
+    selected = ($0 ~ /^\[curr\][[:space:]]*$/)
+    version_seen = 1
+    if (selected) current = ""
+    next
+  }
+  /^version:/ { version_seen = 1 }
+  !version_seen { header = header $0 "\n"; next }
+  selected { current = current $0 "\n" }
+  END { flush() }
+  ' setup.ini
+}
+
+# Modern dependencies override legacy requires:, including an empty list.
+# Setup is required for version solving; never silently discard constraints.
+function package-dependencies {
+  awk '
+  /^requires:/ { legacy = substr($0, index($0, ":") + 1) }
+  /^(depends2|depends):/ {
+    modern = substr($0, index($0, ":") + 1)
+    modern_seen = 1
+  }
+  END {
+    dependencies = modern_seen ? modern : legacy
+    if (modern_seen && dependencies ~ /[()|]/) {
+      print "Versioned or alternative dependencies require Cygwin Setup: " dependencies > "/dev/stderr"
+      exit 1
+    }
+    gsub(/,/, " ", dependencies)
+    count = split(dependencies, names, /[[:space:]]+/)
+    for (i = 1; i <= count; i++) {
+      if (names[i] == "") continue
+      if (names[i] !~ /^[A-Za-z0-9_+.-]+$/) {
+        print "Unsupported dependency; use Cygwin Setup: " names[i] > "/dev/stderr"
+        exit 1
+      }
+      print names[i]
+    }
+  }
+  '
+}
+
+# Dependency graphs display names, while installation validates constraints.
+function dependency-edges {
+  package-description "" | awk '
+  function flush(    list, count, names, i) {
+    list = modern_seen ? modern : legacy
+    gsub(/\([^)]*\)/, "", list)
+    gsub(/,/, " ", list)
+    count = split(list, names, /[[:space:]]+/)
+    for (i = 1; i <= count; i++)
+      if (names[i] != "") print package, names[i]
+  }
+  /^@ / {
+    flush()
+    package = $2
+    legacy = modern = ""
+    modern_seen = 0
+  }
+  /^requires:/ { legacy = substr($0, index($0, ":") + 1) }
+  /^(depends2|depends):/ {
+    modern = substr($0, index($0, ":") + 1)
+    modern_seen = 1
+  }
+  END { flush() }
+  '
+}
+
 function apt-depends {
   find-workspace
   check-packages
   for pkg in "${pks[@]}"
   do
-    awk '
+    dependency-edges | awk '
     @include "join"
-    $1 == "@" {
-      apg = $2
-    }
-    $1 == "requires:" {
-      for (z=2; z<=NF; z++)
-        reqs[apg][z-1] = $z
+    NF == 2 {
+      reqs[$1][length(reqs[$1])+1] = $2
     }
     END {
       prpg(ENVIRON["pkg"])
@@ -304,7 +383,7 @@ function apt-depends {
           prpg(reqs[fpg][each])
       delete spath[length(spath)]
     }
-    ' setup.ini
+    '
   done
 }
 
@@ -312,14 +391,10 @@ function apt-rdepends {
   find-workspace
   for pkg in "${pks[@]}"
   do
-    awk '
+    dependency-edges | awk '
     @include "join"
-    $1 == "@" {
-      apg = $2
-    }
-    $1 == "requires:" {
-      for (z=2; z<=NF; z++)
-        reqs[$z][length(reqs[$z])+1] = apg
+    NF == 2 {
+      reqs[$2][length(reqs[$2])+1] = $1
     }
     END {
       prpg(ENVIRON["pkg"])
@@ -338,7 +413,7 @@ function apt-rdepends {
           prpg(reqs[fpg][each])
       delete spath[length(spath)]
     }
-    ' setup.ini
+    '
   done
 }
 
@@ -358,7 +433,7 @@ function download {
   pkg=$1
   # look for package and save desc file
 
-  awk '$1 == pc' RS='\n\n@ ' FS='\n' pc=$pkg setup.ini > desc
+  package-description "$pkg" > desc
   if [ ! -s desc ]
   then
     echo Unable to locate package $pkg
@@ -436,78 +511,84 @@ function apt-searchall {
 }
 
 function apt-install {
-  check-packages
-  find-workspace
-  local pkg dn bn requires wr package sbq script
+  check-packages || return 1
+  find-workspace || return 1
+  local pkg dn bn requires package script description installed
+  local installing="${APT_CYG_INSTALLING:-}"
+  local install_status=0
   for pkg in "${pks[@]}"
   do
-
-  if grep -q "^$pkg " /etc/setup/installed.db
-  then
-    echo Package $pkg is already installed, skipping
-    continue
-  fi
-  (( sbq++ )) && echo
-  echo Installing $pkg
-
-  download $pkg
-  read dn bn </tmp/dwn
-  echo Unpacking...
-
-  cd "$cache/$mirrordir/$dn"
-  tar -x -C / -f $bn
-  # update the package database
-
-  awk '
-  ins != 1 && pkg < $1 {
-    print pkg, bz, 0
-    ins = 1
-  }
-  1
-  END {
-    if (ins != 1) print pkg, bz, 0
-  }
-  ' pkg="$pkg" bz=$bn /etc/setup/installed.db > /tmp/awk.$$
-  mv /etc/setup/installed.db /etc/setup/installed.db-save
-  mv /tmp/awk.$$ /etc/setup/installed.db
-
-  [ -v nodeps ] && continue
-  # recursively install required packages
-
-  requires=$(awk '$1=="requires", $0=$2' FS=': ' desc)
-  cd ~-
-  wr=0
-  if [[ $requires ]]
-  then
-    echo Package $pkg requires the following packages, installing:
-    echo $requires
-    for package in $requires
+    # Cycles terminate, but installed packages are revisited to repair missing deps.
+    if [[ " $installing " == *" $pkg "* ]]
+    then
+      continue
+    fi
+    description=$(package-description "$pkg")
+    if [[ ! $description ]]
+    then
+      echo "Unable to locate package $pkg" >&2
+      return 1
+    fi
+    requires=""
+    if [[ ! -v nodeps ]]
+    then
+      requires=$(package-dependencies <<< "$description") || return 1
+    fi
+    installed=0
+    if awk -v package="$pkg" 'NR > 1 && $1 == package { found=1 } END { exit !found }' /etc/setup/installed.db
+    then
+      installed=1
+      echo "Package $pkg is already installed, checking dependencies"
+    fi
+    if (( ! installed ))
+    then
+      echo "Installing $pkg"
+      download "$pkg" || return 1
+      read -r dn bn </tmp/dwn || return 1
+      cd "$cache/$mirrordir/$dn" || return 1
+      tar -x -C / -f "$bn" || return 1
+      # Only register a package after its archive was successfully extracted.
+      awk '
+      ins != 1 && pkg < $1 {
+        print pkg, bz, 0
+        ins = 1
+      }
+      1
+      END {
+        if (ins != 1) print pkg, bz, 0
+      }
+      ' pkg="$pkg" bz=$bn /etc/setup/installed.db > /tmp/awk.$$ || return 1
+      cp /etc/setup/installed.db /etc/setup/installed.db-save || return 1
+      mv /tmp/awk.$$ /etc/setup/installed.db || return 1
+      cd ~- || return 1
+    fi
+    if [[ ! -v nodeps && $requires ]]
+    then
+      while IFS= read -r package
+      do
+        if ! APT_CYG_INSTALLING="$installing $pkg" apt-cyg install --noscripts "$package"
+        then
+          echo "Failed to install dependency $package required by $pkg" >&2
+          return 1
+        fi
+      done <<< "$requires"
+    fi
+    [ -v noscripts ] && continue
+    while IFS= read -r script
     do
-      if grep -q "^$package " /etc/setup/installed.db
+      echo "Running $script"
+      if "$script"
       then
-        echo Package $package is already installed, skipping
-        continue
+        mv "$script" "$script.done" || return 1
+      else
+        echo "Postinstall script failed: $script" >&2
+        install_status=1
       fi
-      apt-cyg install --noscripts $package || (( wr++ ))
-    done
-  fi
-  if (( wr ))
-  then
-    echo some required packages did not install, continuing
-  fi
-
-  # run all postinstall scripts
-
-  [ -v noscripts ] && continue
-  find /etc/postinstall -name '*.sh' | while read script
-  do
-    echo Running $script
-    $script
-    mv $script $script.done
+    done < <(find /etc/postinstall -name '*.sh')
+    (( install_status == 0 )) || return 1
+    echo "Package $pkg installed"
   done
-  echo Package $pkg installed
-
-  done
+  return 0
 }
 
 function apt-remove {
