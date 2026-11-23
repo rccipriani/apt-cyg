@@ -1363,18 +1363,22 @@ printf sample > "$out"''')
         self.assertTrue(bash.exists())
 
     def test_zsh_inline_strategy_is_scoped_to_apt_cyg(self):
+        self.package("application")
+        self.write_metadata()
         config = self.root / "suggestions.zsh"
         config.write_text(self.run_cli("autosuggestions").stdout)
         script = '''source "$1"
-_zsh_autosuggest_strategy_completion() { typeset -g suggestion="$1lication"; }
+zpty() { print -u2 'PTY MUST NOT BE USED'; return 99; }
+_zsh_autosuggest_strategy_completion() { print -u2 'COMPLETION CAPTURE MUST NOT BE USED'; return 99; }
 _zsh_autosuggest_strategy_apt_cyg 'apt-cyg install app'
 print -r -- "$suggestion"
 suggestion=''
 _zsh_autosuggest_strategy_apt_cyg 'git status'
 print -r -- "unrelated=$suggestion"
 '''
-        result = subprocess.run(["zsh", "-f", "-c", script, "zsh", str(config)], text=True, capture_output=True, check=True)
+        result = subprocess.run(["zsh", "-f", "-c", script, "zsh", str(config)], env=self.env, text=True, capture_output=True, check=True)
         self.assertEqual(result.stdout.splitlines(), ["apt-cyg install application", "unrelated="])
+        self.assertEqual(result.stderr, "")
 
     def test_interactive_zsh_completes_packages_after_global_option_values(self):
         import pexpect
@@ -1416,6 +1420,155 @@ print -r -- "unrelated=$suggestion"
         self.metadata[-1] = self.metadata[-1].replace(archive.name, renamed.name)
         self.assert_ok(self.run_cli("localinstall", str(renamed), "--yes"))
         self.assertEqual(self.flags(), {"my-app": "1"})
+
+    def test_installed_virtual_providers_and_windows_satisfy_check(self):
+        self.env["APT_CYG_WINDOWS_VERSION"] = "10.0.26100"
+        self.package("gcc-core", extra="provides: gcc14")
+        self.package("perl_base", extra="provides: perl5_044")
+        self.package("gnupg2", extra="obsoletes: gnupg")
+        self.package("libssl1.0", extra="obsoletes: libopenssl100")
+        self.package("app", "_windows, gcc14, perl5_044, gnupg, libopenssl100")
+        self.assert_ok(self.run_install("gcc-core", "perl_base", "gnupg2", "libssl1.0"))
+        self.assert_ok(self.run_install("app"))
+        result = self.run_cli("check", "--files")
+        self.assert_ok(result)
+        self.assertIn("0 error(s)", result.stdout)
+        self.assertNotIn("_windows", self.flags())
+        self.assertNotIn("gcc14", self.flags())
+
+    def test_genuine_missing_dependency_remains_after_virtual_resolution(self):
+        self.package("compiler", extra="provides: gcc14")
+        self.package("app", "gcc14")
+        self.assert_ok(self.run_install("compiler", "app"))
+        self.metadata[-1] += "depends2: gcc14, libdb18.1\n"
+        result = self.run_cli("check", "--files")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("app: missing dependency libdb18.1", result.stderr)
+        self.assertNotIn("missing dependency gcc14", result.stderr)
+
+    def test_explicit_provides_overrides_obsoletes_fallback(self):
+        self.package("replacement", extra="provides: capability-new\nobsoletes: capability-old")
+        self.package("app")
+        self.assert_ok(self.run_install("replacement", "app"))
+        self.metadata[-1] += "depends2: capability-old\n"
+        result = self.run_cli("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing dependency capability-old", result.stderr)
+
+    def test_old_provider_uses_its_installed_version_capabilities(self):
+        self.package("compiler", extra="provides: gcc13")
+        self.package("app", "gcc13")
+        self.assert_ok(self.run_install("compiler", "app"))
+        previous = self.metadata.pop(0).split("\n", 1)[1]
+        self.package("compiler", extra="provides: gcc14\n[prev]\n" + previous, version="2.0-1")
+        self.assert_ok(self.run_cli("check"))
+        self.metadata[0] += "depends2: gcc14\n"
+        result = self.run_cli("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing dependency gcc14", result.stderr)
+
+    def test_provider_snapshots_survive_metadata_expiry(self):
+        self.package("provider", extra="provides: capability")
+        self.package("app", "capability")
+        self.assert_ok(self.run_install("provider", "app"))
+        self.assertTrue((self.setup / "provider.provides").exists())
+        self.metadata.pop(0)
+        self.assert_ok(self.run_cli("check"))
+
+    def test_provider_removal_is_blocked_but_removing_consumers_together_is_allowed(self):
+        self.package("provider", extra="provides: capability")
+        self.package("app", "capability")
+        self.assert_ok(self.run_install("provider", "app"))
+        result = self.run_cli("remove", "provider", "--yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("needed by app", result.stderr)
+        self.assert_ok(self.run_cli("remove", "provider", "app", "--yes"))
+        self.assertEqual(self.flags(), {})
+
+    def test_other_installed_provider_allows_safe_removal(self):
+        self.package("provider-a", extra="provides: capability")
+        self.package("provider-b", extra="provides: capability")
+        self.package("app", "capability")
+        self.assert_ok(self.run_install("provider-a", "provider-b", "app"))
+        self.assert_ok(self.run_cli("remove", "provider-a", "--yes"))
+        self.assert_ok(self.run_cli("check"))
+
+    def test_autoremove_retains_automatic_provider_of_manual_consumer(self):
+        self.package("provider", extra="provides: capability")
+        self.package("app", "capability")
+        self.assert_ok(self.run_install("provider", "app"))
+        self.assert_ok(self.run_cli("mark-auto", "provider"))
+        self.assert_ok(self.run_cli("autoremove", "--yes"))
+        self.assert_installed("provider", "app")
+        self.assertEqual(self.run_cli("list-required-packages").stdout.splitlines(), ["app", "provider"])
+        self.assertNotIn("capability", self.run_cli("list-lacked-packages").stdout)
+
+    def test_unknown_virtual_dependency_is_not_silently_satisfied(self):
+        self.package("app", "nonexistent-capability")
+        result = self.run_install("app")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.flags(), {})
+
+    def test_windows_capability_is_not_assumed_on_non_windows_hosts(self):
+        self.package("app")
+        self.assert_ok(self.run_install("app"))
+        self.metadata[-1] += "depends2: _windows\n"
+        result = self.run_cli("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing dependency _windows", result.stderr)
+
+    def test_qualified_provides_does_not_invent_an_unqualified_capability(self):
+        self.package("provider", extra="provides: capability (= 2)")
+        self.package("app")
+        self.assert_ok(self.run_install("provider", "app"))
+        self.metadata[-1] += "depends2: capability\n"
+        self.assertNotEqual(self.run_cli("check").returncode, 0)
+
+    def test_inline_suggestions_handle_commands_options_and_reject_shell_syntax(self):
+        self.package("application")
+        self.write_metadata()
+        config = self.root / "suggestions.zsh"
+        config.write_text(self.run_cli("autosuggestions").stdout)
+        script = '''source "$1"
+zpty() { return 99; }
+for input in 'apt-cyg h' 'apt-cyg --proxy inherit install app' 'apt-cyg --sh' 'apt-cyg completion-install --shell z'; do
+  suggestion=''; _zsh_autosuggest_strategy_apt_cyg "$input"; print -r -- "$suggestion"
+done
+suggestion=''; _zsh_autosuggest_strategy_apt_cyg 'apt-cyg install $(touch should-not-run)'; print -r -- "unsafe=$suggestion"
+'''
+        result = subprocess.run(["zsh", "-f", "-c", script, "zsh", str(config)], env=self.env, text=True, capture_output=True, check=True)
+        self.assertEqual(result.stdout.splitlines(), ["apt-cyg help", "apt-cyg --proxy inherit install application", "apt-cyg --shell", "apt-cyg completion-install --shell zsh", "unsafe="])
+        self.assertEqual(result.stderr, "")
+
+    def test_explicit_provider_can_follow_consumer_in_same_install_plan(self):
+        self.package("provider", extra="provides: capability")
+        self.package("app", "capability")
+        self.assert_ok(self.run_install("app", "provider"))
+        self.assert_installed("app", "provider")
+
+    def test_upgrade_cannot_drop_a_capability_required_by_unchanged_consumer(self):
+        self.package("provider", extra="provides: old-capability")
+        self.package("app", "old-capability")
+        self.assert_ok(self.run_install("provider", "app"))
+        previous = self.metadata.pop(0).split("\n", 1)[1]
+        self.package("provider", version="2.0-1", extra="provides: new-capability\n[prev]\n" + previous)
+        before = self.db.read_bytes()
+        result = self.run_cli("upgrade", "provider", "--yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("loses its provider", result.stderr)
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_removal_requires_provider_records_even_for_target_packages(self):
+        self.package("provider", extra="provides: capability")
+        self.package("app", "capability")
+        self.assert_ok(self.run_install("provider", "app"))
+        self.metadata.pop(0)
+        (self.setup / "provider.provides").unlink()
+        before = self.db.read_bytes()
+        result = self.run_cli("remove", "provider", "--yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("provider metadata unavailable", result.stderr)
+        self.assertEqual(self.db.read_bytes(), before)
 
 
 if __name__ == "__main__":

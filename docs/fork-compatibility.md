@@ -115,3 +115,18 @@ Native Zsh completion and optional zsh-autosuggestions integration are additiona
 features beyond the reviewed Bash-completion forks. Completion candidates are
 read-only and offline; Bash completion also handles value-bearing options before
 the operation and forwards cache/mirror overrides to that backend.
+
+## Virtual capabilities and PTY-free inline suggestions
+
+The index records provides per package version and uses obsoletes as a fallback
+only in the absence of explicit provides, matching official Setup. Installed
+providers and explicitly planned providers satisfy aliases in checks/plans;
+removal, autoremove and reports follow the real provider packages. The synthetic
+_windows capability is recognized on Cygwin hosts. Qualified capability rules and
+ambiguous new-provider selection remain delegated to Setup. Version-tied provider
+sidecars preserve knowledge when old metadata expires.
+
+Inline autosuggestions use cached candidates directly and no longer delegate to
+the upstream completion strategy or zpty. Native Tab completion is unchanged.
+Existing global upstream completion strategies still retain their own PTY
+requirements; the README shows the compatible history/apt_cyg configuration.
