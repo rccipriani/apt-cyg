@@ -51,6 +51,29 @@ DESCRIPTION
   line arguments, or one per line on a pipe.
 
 OPERATIONS
+  check         Diagnose database, manifests, missing dependencies and scripts.
+                --files checks file presence; --fix plans repairs.
+  localinstall  Install local archive(s); --allow-untrusted requires a .hint.
+  setup         Verify and launch official Setup; pass native options after --.
+  update-setup  Download and signature-verify the official Setup executable.
+  dist-upgrade  Launch official Setup with --upgrade-also; never kills processes.
+  busy          Observe package files in readable process maps.
+  show-packages-busyness  Alias for busy.
+  source, mirror-source   Download and verify current source archives to cache.
+  describe      Search package names and short/long descriptions (regexp).
+  find          Alias for listall.
+  ls-categories List category names.
+  key-del       Remove keys by full primary fingerprint.
+  key-finger    Alias for key-list.
+  mirrors-list-online    Download official mirror URLs (--long for details).
+  mirrors-list-long      Show recorded mirror details.
+  benchmark-parallel-mirrors  Benchmark URLs concurrently (--max-jobs N).
+  benchmark-parallel-mirrors-list  Benchmark recorded mirrors concurrently.
+  pathof        Print root/cache/mirror/mirrordir/setup.ini/database/keyring/setup.
+  stats         Print available, installed, and cached package statistics.
+  packages-total-count, packages-total-size, packages-cached-count,
+  packages-cached-size  Print individual statistics (sizes in archive bytes).
+  scriptinfo    Show script and environment paths.
   install       Install package(s) and their dependencies.
   reinstall     Reinstall installed package(s).
   upgrade       Upgrade all (or the named) installed packages.
@@ -84,6 +107,19 @@ OPERATIONS
   completion-uninstall  Remove the installed Bash completion script.
 
 OPTIONS
+  --files, --fix         Integrity check options.
+  --name NAME            Override the name of one local archive.
+  --allow-untrusted      Explicitly trust a local archive and its .hint.
+  --ignore-case, -i      Case-insensitive list/find/describe queries.
+  --quiet, -q            Suppress stdout and download progress, retain errors.
+  --verbose, -v          Show downloader and resolved environment diagnostics.
+  --no-progress          Suppress downloader progress bars.
+  --proxy MODE           inherit (default), none, or proxy URL.
+  --file FILE, -f FILE   Append targets from a file, one per line.
+  --mirror URL, -m URL   Use a mirror for this invocation only.
+  --cache DIR, -c DIR    Use a cache for this invocation only.
+  --max-jobs N, -j N     Parallel mirror workers, 1..64 (default 4).
+  --long                Full online mirror records.
   --nodeps      Skip all dependency handling.
   --noscripts   Do not run postinstall / preremove scripts.
   -s, --simulate, --dry-run
@@ -110,16 +146,19 @@ Copyright (c) 2013 Trans-code Design
 Copyright (c) 2026 ZenSage Design
 "
 
-COMMANDS='mark-auto mark-manual list-auto list-manual key-add key-list
+COMMANDS='check localinstall setup update-setup dist-upgrade show-packages-busyness busy source mirror-source key-del key-finger pathof stats packages-total-count packages-total-size packages-cached-count packages-cached-size describe find ls-categories scriptinfo mirrors-list-online mirrors-list-long benchmark-parallel-mirrors benchmark-parallel-mirrors-list
+  mark-auto mark-manual list-auto list-manual key-add key-list
   self-update upgrade-self benchmark-mirrors mirrors-list completion
   completion-install completion-uninstall install reinstall upgrade remove autoremove update
   download show depends rdepends list listall category listfiles search
   searchall mirror cache'
 # commands that read package names from a pipe when none are given
-TARGET_COMMANDS='mark-auto mark-manual key-add install reinstall remove download show
+TARGET_COMMANDS='localinstall source mirror-source describe find key-del show-packages-busyness busy
+  mark-auto mark-manual key-add install reinstall remove download show
   depends rdepends category listfiles search searchall'
 # Commands that change package state or persistent configuration.
-MUTATING_COMMANDS='mark-auto mark-manual key-add self-update upgrade-self
+MUTATING_COMMANDS='localinstall key-del update-setup setup dist-upgrade
+  mark-auto mark-manual key-add self-update upgrade-self
   completion-install completion-uninstall install reinstall upgrade remove autoremove
   update mirror cache'
 
@@ -142,14 +181,14 @@ SELF_UPDATE_URL=https://raw.githubusercontent.com/rccipriani/apt-cyg/master/apt-
 CYGWIN_FINGERPRINT=56405CF6FCC81574682A5D561A698DE9E2E56300
 
 
-declare -A IDX_FILE IDX_HASH IDX_VER IDX_DEPS IDX_CAT IDX_REL
+declare -A IDX_FILE IDX_HASH IDX_VER IDX_DEPS IDX_CAT IDX_REL IDX_SIZE IDX_SOURCE IDX_SOURCE_SIZE IDX_SOURCE_HASH
 declare -A INST_DEPS INST_KNOWN
 declare -A INST_FILE INST_FLAG
 declare -A PLAN_SEEN PLAN_ACT PLAN_FLAG PLAN_ARCHIVE UPG_SET REINST_SET
 PLAN=()
 pks=()
 DB_HEADER='INSTALLED.DB 3'
-IDX_MAGIC='#apt-cyg-index|2'
+IDX_MAGIC='#apt-cyg-index|3'
 
 # ---------------------------------------------------------------------------
 # messages, cleanup and locking
@@ -263,6 +302,7 @@ function fetch-once {
   # fetch URL DEST [text]: download through a temp name so a broken
   # transfer never leaves a truncated file under the real name
   local url=$1 out=$2 part=$2.part.$$ rc opts
+  [[ ! -v verbose ]] || printf 'Downloader: %s\n' "$(downloader)" >&2
   case $url in
     file://*)
       cp -- "${url#file://}" "$part" ;;
@@ -272,14 +312,16 @@ function fetch-once {
       case $(downloader) in
         wget)
           opts=(--timeout="${APT_CYG_TIMEOUT:-30}" --tries=1 -O "$part")
-          [[ -t 2 ]] && opts+=(--progress=bar) || opts+=(-nv)
+          if [[ -v quiet ]]; then opts+=(-q)
+          elif [[ -t 2 && ! -v no_progress ]]; then opts+=(--progress=bar)
+          else opts+=(-nv); fi
           # gzip transfer helps plain text only, packages are xz/zst already
           # and a Content-Encoding on them could break the checksum
           [[ $3 == text ]] && wget-has-compression && opts+=(--compression=auto)
           command wget "${opts[@]}" "$url" ;;
         curl)
           opts=(-fL --max-time "${APT_CYG_TIMEOUT:-30}" -o "$part")
-          [[ -t 2 ]] || opts+=(-sS)
+          [[ -t 2 && ! -v quiet && ! -v no_progress ]] || opts+=(-sS)
           [[ $3 == text ]] && opts+=(--compressed)
           command curl "${opts[@]}" "$url" ;;
         lynx)
@@ -386,8 +428,8 @@ function find-workspace {
   # find-workspace [soft]: soft returns 1 instead of dying when unconfigured
   local soft=$1
   [[ $archdir ]] && return 0
-  cache=$(rc-get last-cache)
-  mirror=$(rc-get last-mirror)
+  cache=${cache_override:-$(rc-get last-cache)}
+  mirror=${mirror_override:-$(rc-get last-mirror)}
   if [[ ! $cache || ! $mirror ]]
   then
     [[ $soft ]] && return 1
@@ -432,7 +474,12 @@ function decompress-metadata {
 
 function prepare-keyring {
   command -v gpg >/dev/null || { warn 'gnupg is required for signature verification'; return 1; }
-  [[ -s $KEYRING ]] && return 0
+  if [[ -e $KEYRING ]]
+  then
+    [[ -s $KEYRING ]] && return 0
+    warn 'trusted keyring is empty; explicitly add a trusted key'
+    return 1
+  fi
   if [[ $APT_CYG_KEYRING ]]
   then
     warn "trusted keyring does not exist: $KEYRING"
@@ -522,6 +569,9 @@ function get-setup {
 IDX_AWK='
 function deplist(s,    n, i, a, out) {
   gsub(/\([^)]*\)/, "", s)
+  # The raw expression is retained separately for rejection by the solver.
+  # Do not let an alternative operator become an index field separator.
+  gsub(/\|/, " ", s)
   n = split(s, a, /[ ,]+/)
   out = ""
   for (i = 1; i <= n; i++)
@@ -529,7 +579,7 @@ function deplist(s,    n, i, a, out) {
   return out
 }
 function reset_version() {
-  file = size = hash = ver = req = relation = ""
+  file = size = hash = ver = req = relation = srfile = srsize = srhash = ""
   modern_seen = 0
 }
 function version_flush(    filename, dependencies, raw) {
@@ -540,14 +590,15 @@ function version_flush(    filename, dependencies, raw) {
       (ENVIRON["wanted_archive"] == "" && curr)) {
     raw = modern_seen ? relation : (req != "" ? req : base_requires)
     dependencies = deplist(raw)
-    chosen = name OFS file OFS size OFS hash OFS ver OFS dependencies OFS cats OFS raw
+    gsub(/\|/, "%7C", raw)
+    chosen = name OFS file OFS size OFS hash OFS ver OFS dependencies OFS cats OFS raw OFS srfile OFS srsize OFS srhash
   }
 }
 function flush() {
   version_flush()
   if (chosen != "") print chosen
 }
-BEGIN { OFS = "|"; print "#apt-cyg-index", "2" }
+BEGIN { OFS = "|"; print "#apt-cyg-index", "3" }
 inq {
   if (gsub(/"/, "&") % 2) inq = 0
   next
@@ -571,6 +622,7 @@ name == "" { next }
 }
 $1 == "version:" { version_seen = 1; ver = $2 }
 $1 == "install:" { file = $2; size = $3; hash = $4 }
+$1 == "source:" { srfile = $2; srsize = $3; srhash = $4 }
 $1 == "requires:" {
   if (!version_seen) base_requires = substr($0, 10)
   else req = substr($0, 10)
@@ -585,16 +637,16 @@ END { flush() }
 '
 
 function select-installed-version {
-  local p=$1 record n f size h v d c relation
+  local p=$1 record n f size h v d c relation sf ss sh
   record=$(wanted_package="$p" wanted_archive="${INST_FILE[$p]}" gawk "$IDX_AWK" "$archdir/setup.ini" | tail -n +2)
   [[ $record ]] || { warn "authenticated metadata for installed version of $p is unavailable; use Cygwin Setup"; return 1; }
-  IFS='|' read -r n f size h v d c relation <<< "$record"
+  IFS='|' read -r n f size h v d c relation sf ss sh <<< "$record"
   IDX_FILE[$p]=$f
   IDX_HASH[$p]=$h
   IDX_VER[$p]=$v
   IDX_DEPS[$p]=$d
   IDX_CAT[$p]=$c
-  IDX_REL[$p]=$relation
+  IDX_REL[$p]=${relation//%7C/|}
 }
 
 function build-index {
@@ -612,9 +664,9 @@ function build-index {
 function load-index {
   [[ $INDEX_LOADED ]] && return 0
   build-index || die 'cannot build the package index'
-  local n f s h v d c relation
+  local n f s h v d c relation sf ss sh
   # '|' rather than tab: a non-blank IFS keeps empty fields in place
-  while IFS='|' read -r n f s h v d c relation
+  while IFS='|' read -r n f s h v d c relation sf ss sh
   do
     [[ $n == '#'* ]] && continue
     IDX_FILE[$n]=$f
@@ -622,7 +674,9 @@ function load-index {
     IDX_VER[$n]=$v
     IDX_DEPS[$n]=$d
     IDX_CAT[$n]=$c
-    IDX_REL[$n]=$relation
+    IDX_REL[$n]=${relation//%7C/|}
+    IDX_SIZE[$n]=$s
+    IDX_SOURCE[$n]=$sf IDX_SOURCE_SIZE[$n]=$ss IDX_SOURCE_HASH[$n]=$sh
   done < "$archdir/setup.idx"
   INDEX_LOADED=1
   [[ ! $DB_LOADED ]] || load-installed-dependencies
@@ -1463,7 +1517,7 @@ function apt-list {
   do
     # a blank line between groups: let fails while sbq is still 0
     let sbq++ && echo
-    printf '%s\n' "${names[@]}" | pat=$pkg gawk '$0 ~ ENVIRON["pat"]'
+    printf '%s\n' "${names[@]}" | pat=$pkg fold=${ignore_case:-0} gawk 'BEGIN { IGNORECASE=ENVIRON["fold"] } $0 ~ ENVIRON["pat"]'
   done
   let sbq && return 0
   printf '%s\n' "${names[@]}"
@@ -1477,7 +1531,7 @@ function apt-listall {
   for pkg in "${pks[@]}"
   do
     let sbq++ && echo
-    pat=$pkg gawk -F'|' 'NR > 1 && $1 ~ ENVIRON["pat"] { print $1 }' "$archdir/setup.idx"
+    pat=$pkg fold=${ignore_case:-0} gawk -F'|' 'BEGIN { IGNORECASE=ENVIRON["fold"] } NR > 1 && $1 ~ ENVIRON["pat"] { print $1 }' "$archdir/setup.idx"
   done
 }
 
@@ -1747,8 +1801,8 @@ function apt-completion {
 # Bash completion for apt-cyg. Source this file from Bash.
 _apt_cyg_complete() {
   local word=${COMP_WORDS[COMP_CWORD]} operation= item
-  local commands='install upgrade reinstall remove autoremove update download show depends rdepends list listall category listfiles search searchall mirror cache mark-auto mark-manual list-auto list-manual key-add key-list self-update upgrade-self benchmark-mirrors mirrors-list completion completion-install completion-uninstall'
-  local options='--simulate --dry-run --yes --nodeps --noscripts --no-verify --force --help --version'
+  local commands='check localinstall setup update-setup dist-upgrade show-packages-busyness busy source mirror-source key-del key-finger pathof stats packages-total-count packages-total-size packages-cached-count packages-cached-size describe find ls-categories scriptinfo mirrors-list-online mirrors-list-long benchmark-parallel-mirrors benchmark-parallel-mirrors-list install upgrade reinstall remove autoremove update download show depends rdepends list listall category listfiles search searchall mirror cache mark-auto mark-manual list-auto list-manual key-add key-list self-update upgrade-self benchmark-mirrors mirrors-list completion completion-install completion-uninstall'
+  local options='--files --fix --allow-untrusted --ignore-case --quiet --verbose --no-progress --long --proxy --file --name --max-jobs --mirror --cache --simulate --dry-run --yes --nodeps --noscripts --no-verify --force --help --version'
   for item in "${COMP_WORDS[@]:1:COMP_CWORD-1}"
   do
     [[ $item == -* ]] || { operation=$item; break; }
@@ -1761,9 +1815,9 @@ _apt_cyg_complete() {
     mapfile -t COMPREPLY < <(compgen -W "$commands" -- "$word")
   else
     case $operation in
-      remove|reinstall|mark-auto|mark-manual)
+      remove|reinstall|mark-auto|mark-manual|busy|show-packages-busyness|check)
         mapfile -t COMPREPLY < <(compgen -W "$(apt-cyg list 2>/dev/null)" -- "$word") ;;
-      install|upgrade|download|show|depends|rdepends)
+      install|upgrade|download|source|mirror-source|show|depends|rdepends)
         mapfile -t COMPREPLY < <(compgen -W "$(apt-cyg listall '.*' 2>/dev/null)" -- "$word") ;;
     esac
   fi
@@ -1784,13 +1838,473 @@ function apt-completion-uninstall {
   rm -f -- "$ROOT/etc/bash_completion.d/apt-cyg"
 }
 
+# Additional operations integrated into the single-file installer.
+
+function valid-name {
+  [[ $1 =~ ^[A-Za-z0-9_+.-]+$ && $1 != . && $1 != .. ]]
+}
+
+function safe-relative-path {
+  [[ $1 && $1 != /* && /$1/ != */../* && $1 != *$'\n'* && $1 != *\\* ]]
+}
+
+function validate-database {
+  [[ -f $DB ]] || { warn "missing database: $DB"; return 1; }
+  gawk '
+  NR == 1 { if ($0 != "INSTALLED.DB 3") { print "invalid database header"; bad=1 }; next }
+  NF != 3 || $1 !~ /^[A-Za-z0-9_+.-]+$/ || $1 == "." || $1 == ".." ||
+    $2 !~ /^[^/\\]+\.tar\.[A-Za-z0-9]+$/ || $3 !~ /^[01]$/ {
+    print "malformed database entry at line " NR; bad=1; next
+  }
+  seen[$1]++ { print "duplicate database entry: " $1; bad=1 }
+  END { if (NR == 0) bad=1; exit bad }
+  ' "$DB"
+}
+
+function check-scan {
+  local p d entry script manifest bad
+  CHECK_ERRORS=0 CHECK_BROKEN=() CHECK_MISSING=()
+  for p in "${CHECK_TARGETS[@]}"
+  do
+    is-installed "$p" || { warn "$p is not installed"; (( CHECK_ERRORS++ )); continue; }
+    bad=0
+    manifest=$SETUP/$p.lst.gz
+    if [[ ! -f $manifest ]] || ! gzip -cd -- "$manifest" > "$TMPD/check.manifest"
+    then
+      warn "$p: missing or unreadable manifest"
+      bad=1
+    elif [[ -v files ]]
+    then
+      while IFS= read -r entry
+      do
+        entry=${entry#./}; entry=${entry#/}
+        [[ ! $entry || $entry == */ ]] && continue
+        if ! safe-relative-path "$entry" || [[ ! -e $ROOT/$entry && ! -L $ROOT/$entry ]]
+        then
+          warn "$p: missing or invalid file: $entry"
+          bad=1
+        fi
+      done < "$TMPD/check.manifest"
+    fi
+    if (( bad )); then CHECK_BROKEN+=("$p"); (( CHECK_ERRORS++ )); fi
+    if [[ ! ${INST_KNOWN[$p]} ]]
+    then
+      warn "$p: installed-version dependency metadata unavailable"
+      (( CHECK_ERRORS++ ))
+      continue
+    fi
+    for d in ${INST_DEPS[$p]}
+    do
+      if ! is-installed "$d"
+      then
+        warn "$p: missing dependency $d"
+        CHECK_MISSING+=("$d")
+        (( CHECK_ERRORS++ ))
+      fi
+    done
+  done
+  for script in "$POSTINSTALL"/*.{sh,dash,bat,cmd}
+  do
+    [[ -f $script ]] || continue
+    case ${script##*/} in 0p_*|zp_*) continue ;; esac
+    warn "pending postinstall: ${script##*/}"
+    (( CHECK_ERRORS++ ))
+  done
+  printf 'check: %s error(s)\n' "$CHECK_ERRORS"
+  (( CHECK_ERRORS == 0 ))
+}
+
+function apt-check {
+  validate-database || { warn 'database requires manual repair; no automatic changes made'; return 1; }
+  find-workspace
+  load-index
+  load-db
+  local p
+  CHECK_TARGETS=("${pks[@]}")
+  (( ${#CHECK_TARGETS[@]} )) || mapfile -t CHECK_TARGETS < <(sorted-installed)
+  check-scan && return 0
+  [[ -v fix ]] || return 1
+  for p in "${CHECK_TARGETS[@]}"
+  do
+    is-installed "$p" && [[ ${INST_KNOWN[$p]} ]] || { warn "cannot repair dependency records for $p automatically; use Setup"; return 1; }
+    # Repair must not silently discard constraints on an existing Setup package.
+    if [[ ! -f $SETUP/$p.deps ]] || [[ $(head -n 1 "$SETUP/$p.deps") != "${INST_FILE[$p]}" ]]
+    then
+      select-installed-version "$p" || return 1
+      validate-dependencies "$p" || return 1
+    fi
+  done
+  for p in "${CHECK_BROKEN[@]}"
+  do
+    guard-running-cygwin "$p" || return 1
+    select-installed-version "$p" || return 1
+    REINST_SET[$p]=1
+  done
+  for p in "${CHECK_BROKEN[@]}" "${CHECK_MISSING[@]}"
+  do
+    plan-visit "$p" || return 1
+  done
+  run-plan || return 1
+  [[ -v simulate ]] && { echo 'Would recheck repaired packages and retry pending scripts.'; return 0; }
+  check-scan
+}
+
+function apt-localinstall {
+  check-packages || return 1
+  [[ ! $pkgname || ${#pks[@]} == 1 ]] || die '--name requires exactly one archive'
+  find-workspace
+  load-index
+  load-db
+  local input archive base name record n f sz hash ver deps cats relation sf ss sh hint raw
+  local -a names=()
+  declare -A local_seen
+  for input in "${pks[@]}"
+  do
+    [[ -f $input ]] || { warn "archive not found: $input"; return 1; }
+    base=${input##*/}
+    [[ $base =~ ^[A-Za-z0-9_+.:~.-]+\.tar\.[A-Za-z0-9]+$ ]] || { warn "invalid archive filename: $base"; return 1; }
+    if [[ $pkgname ]]; then name=$pkgname
+    elif [[ $base =~ ^(.+)-[^-]+-[^-]+\.tar\.[[:alnum:]]+$ ]]; then name=${BASH_REMATCH[1]}
+    else warn "cannot determine package name: $base; use --name"; return 1; fi
+    valid-name "$name" || die "invalid package name: $name"
+    [[ ! ${local_seen[$name]} ]] || die "multiple local archives supplied for $name"
+    local_seen[$name]=1
+    guard-running-cygwin "$name" || return 1
+    archive=$TMPD/local-${#names[@]}-$base
+    cp -- "$input" "$archive" || return 1
+    tar -tf "$archive" > "$TMPD/local.files" || return 1
+    while IFS= read -r f
+    do
+      f=${f#./}
+      [[ $f == ./ || $f == . ]] && continue
+      safe-relative-path "$f" || { warn "unsafe archive member: $f"; return 1; }
+    done < "$TMPD/local.files"
+    record=$(wanted_package="$name" wanted_archive="$base" gawk "$IDX_AWK" "$archdir/setup.ini" | tail -n +2)
+    if [[ $record ]]
+    then
+      IFS='|' read -r n f sz hash ver deps cats relation sf ss sh <<< "$record"
+      verify-hash "$archive" "$hash" || { warn "local archive does not match authenticated metadata: $base"; return 1; }
+    else
+      [[ -v allow_untrusted ]] || { warn "$base is not in authenticated metadata; use --allow-untrusted only for a trusted local package"; return 1; }
+      hint=${input%.tar.*}.hint
+      [[ -f $hint ]] || { warn "local package requires dependency metadata: $hint"; return 1; }
+      raw=$(gawk '
+        $1 == "requires:" { req=substr($0,index($0,":")+1); seen=1 }
+        $1 == "depends:" { dep=substr($0,index($0,":")+1); modern=1; seen=1 }
+        $1 == "depends2:" { dep2=substr($0,index($0,":")+1); newest=1; seen=1 }
+        END { if (!seen) exit 1; print newest ? dep2 : modern ? dep : req }
+      ' "$hint") || { warn 'hint must explicitly declare dependencies, even an empty list'; return 1; }
+      [[ $raw != *'|'* && $raw != *'('* && $raw != *')'* ]] || { warn 'version constraints and alternatives require Cygwin Setup'; return 1; }
+      relation=$raw
+      deps=${raw//,/ }
+      warn "explicitly trusting local archive: $base"
+    fi
+    IDX_FILE[$name]=$base IDX_DEPS[$name]=$deps IDX_REL[$name]=${relation//%7C/|}
+    validate-dependencies "$name" || return 1
+    # Keep the original basename: installed.db must never record our temporary prefix.
+    mkdir -p -- "$TMPD/local-${#names[@]}" || return 1
+    mv -- "$archive" "$TMPD/local-${#names[@]}/$base" || return 1
+    PLAN_ARCHIVE[$name]=$TMPD/local-${#names[@]}/$base
+    PLAN_FLAG[$name]=1
+    is-installed "$name" && UPG_SET[$name]=1
+    names+=("$name")
+  done
+  for name in "${names[@]}"; do plan-visit "$name" || return 1; done
+  run-plan || return 1
+  if [[ ! -v simulate ]]
+  then
+    for name in "${names[@]}"; do INST_FLAG[$name]=1; done
+    save-db
+  fi
+}
+
+function apt-key-del {
+  check-packages || return 1
+  [[ -s $KEYRING ]] || die 'trusted keyring is missing'
+  local fingerprint primaries
+  gpg --batch --homedir "$TMPD/gpg" --import "$KEYRING" >/dev/null 2>&1 || return 1
+  primaries=$(gpg --batch --homedir "$TMPD/gpg" --with-colons --list-keys |
+    gawk -F: '$1 == "pub" { primary=1; next } primary && $1 == "fpr" { print $10; primary=0 }') || return 1
+  for fingerprint in "${pks[@]}"
+  do
+    [[ $fingerprint =~ ^([[:xdigit:]]{40}|[[:xdigit:]]{64})$ ]] || die 'key-del requires a full primary-key fingerprint'
+    in-list "${fingerprint^^}" "$primaries" || die "primary-key fingerprint not found: $fingerprint"
+    gpg --batch --yes --homedir "$TMPD/gpg" --delete-key "$fingerprint" || return 1
+  done
+  gpg --batch --homedir "$TMPD/gpg" --export > "$KEYRING.tmp.$$" || return 1
+  mv -f -- "$KEYRING.tmp.$$" "$KEYRING"
+}
+
+function apt-key-finger { apt-key-list; }
+
+function apt-source {
+  check-packages || return 1
+  find-workspace
+  load-index
+  local name relative destination hash
+  for name in "${pks[@]}"
+  do
+    relative=${IDX_SOURCE[$name]} hash=${IDX_SOURCE_HASH[$name]}
+    safe-relative-path "$relative" || { warn "no valid current source archive for $name"; return 1; }
+    destination=$cachedir/$relative
+    mkdir -p -- "${destination%/*}" || return 1
+    if [[ ! -f $destination ]] || ! verify-hash "$destination" "$hash"
+    then
+      fetch "$mirrorurl/$relative" "$destination" || return 1
+    fi
+    verify-hash "$destination" "$hash" || { warn "source checksum mismatch: $name"; return 1; }
+    printf '%s\n' "$destination"
+  done
+}
+
+function apt-mirror-source { apt-source; }
+
+function apt-mirrors-list-online {
+  fetch https://cygwin.com/mirrors.lst "$TMPD/mirrors.lst" || return 1
+  if [[ -v long_listing ]]; then cat -- "$TMPD/mirrors.lst"
+  else gawk -F';' '$1 ~ /^(https?|ftp):\/\// { print $1 }' "$TMPD/mirrors.lst"; fi
+}
+
+function apt-mirrors-list-long {
+  [[ -f $RC ]] || return 1
+  gawk '$0 == "mirrors-lst" { active=1; next }
+    active && /^\t/ { sub(/^\t/, ""); print; next } active { exit }' "$RC"
+}
+
+function benchmark-one {
+  local url=${1%/} id=$2 started finished elapsed output=$TMPD/benchmark.$2
+  started=$(date +%s%N)
+  if APT_CYG_TIMEOUT=${APT_CYG_BENCHMARK_TIMEOUT:-10} fetch "$url/$arch/setup.xz" "$output" 2>/dev/null
+  then
+    finished=$(date +%s%N)
+    elapsed=$(gawk -v start="$started" -v end="$finished" 'BEGIN { printf "%.3f", (end-start)/1000000000 }')
+    printf '%s\t%s\t%s\n' "$elapsed" "$(wc -c < "$output")" "$url" > "$TMPD/result.$id"
+  else printf 'FAILED\t0\t%s\n' "$url" >&2; return 1; fi
+}
+
+function apt-benchmark-parallel-mirrors {
+  local url pid i=0 failures=0
+  local -a candidates=("${pks[@]}") pids=()
+  if (( ! ${#candidates[@]} )); then mapfile -t candidates < <(apt-mirrors-list); fi
+  (( ${#candidates[@]} )) || { warn 'no mirrors supplied or recorded'; return 1; }
+  for url in "${candidates[@]}"
+  do
+    benchmark-one "$url" "$i" &
+    pids+=("$!"); (( i++ ))
+    if (( ${#pids[@]} >= max_jobs ))
+    then
+      for pid in "${pids[@]}"; do wait "$pid" || (( failures++ )); done
+      pids=()
+    fi
+  done
+  for pid in "${pids[@]}"; do wait "$pid" || (( failures++ )); done
+  printf 'seconds\tbytes\tmirror\n'
+  local -a results=("$TMPD"/result.*)
+  [[ -f ${results[0]} ]] || return 1
+  LC_ALL=C sort -n -k1,1 "${results[@]}"
+  (( failures == 0 ))
+}
+
+function apt-benchmark-parallel-mirrors-list {
+  pks=()
+  apt-benchmark-parallel-mirrors
+}
+
+function apt-pathof {
+  local item
+  (( ${#pks[@]} )) || pks=(root cache mirror mirrordir setup.ini database keyring setup)
+  no_auto_setup=1 find-workspace
+  for item in "${pks[@]}"
+  do
+    case $item in
+      root) printf '%s\n' "${ROOT:-/}" ;;
+      cache) printf '%s\n' "$cache" ;;
+      mirror) printf '%s\n' "$mirrorurl" ;;
+      mirrordir|cache/mirrordir) printf '%s\n' "$cachedir" ;;
+      setup.ini) printf '%s\n' "$archdir/setup.ini" ;;
+      database) printf '%s\n' "$DB" ;;
+      keyring) printf '%s\n' "$KEYRING" ;;
+      setup) printf '%s\n' "$SETUP/setup-bin/setup-$arch.exe" ;;
+      *) warn "unknown path: $item"; return 1 ;;
+    esac
+  done
+}
+
+function apt-stats {
+  find-workspace
+  load-index
+  load-db
+  local count size
+  read -r count size < <(gawk -F'|' 'NR > 1 { n++; bytes+=$3 } END { printf "%d %.0f\n",n,bytes }' "$archdir/setup.idx")
+  printf 'available-packages\t%s\navailable-archive-bytes\t%s\ninstalled-packages\t%s\n' "$count" "$size" "${#INST_FILE[@]}"
+  read -r count size < <(find "$cachedir" -type f -name '*.tar.*' ! -name '*.part.*' -printf '%s\n' |
+    gawk '{ n++; bytes+=$1 } END { printf "%d %.0f\n",n,bytes }')
+  printf 'cached-archives\t%s\ncached-archive-bytes\t%s\n' "$count" "$size"
+}
+
+function apt-packages-total-count { apt-stats | gawk '$1 == "available-packages" { print $2 }'; }
+function apt-packages-total-size { apt-stats | gawk '$1 == "available-archive-bytes" { print $2 }'; }
+function apt-packages-cached-count { apt-stats | gawk '$1 == "cached-archives" { print $2 }'; }
+function apt-packages-cached-size { apt-stats | gawk '$1 == "cached-archive-bytes" { print $2 }'; }
+
+function apt-describe {
+  check-packages || return 1
+  find-workspace
+  local pattern
+  for pattern in "${pks[@]}"
+  do
+    pat=$pattern fold=${ignore_case:-0} gawk '
+      function flush( text, p) {
+        text=name " " desc " " longdesc; p=ENVIRON["pat"]
+        if (ENVIRON["fold"] == 1) { text=tolower(text); p=tolower(p) }
+        if (name != "" && text ~ p) print name " - " desc
+      }
+      /^@ / { flush(); name=$2; desc=longdesc=""; multiline=0; next }
+      /^sdesc:/ { desc=substr($0,8); gsub(/^"|"$/, "", desc) }
+      /^ldesc:/ { longdesc=substr($0,8); multiline=(gsub(/"/, "&") % 2); next }
+      multiline { longdesc=longdesc " " $0; if (gsub(/"/, "&") % 2) multiline=0 }
+      END { flush() }
+    ' "$archdir/setup.ini" || return 1
+  done
+}
+
+function apt-find { apt-listall; }
+
+function apt-ls-categories {
+  find-workspace
+  build-index || return 1
+  gawk -F'|' 'NR > 1 { n=split($7,a," "); for(i=1;i<=n;i++) if(a[i]!="") print a[i] }' "$archdir/setup.idx" | LC_ALL=C sort -u
+}
+
+function apt-scriptinfo {
+  printf 'script\t%s\nroot\t%s\ndatabase\t%s\narchitecture\t%s\ndownloader\t%s\n' "$SELF" "${ROOT:-/}" "$DB" "$arch" "$(downloader)"
+}
+
+function apt-show-packages-busyness {
+  check-packages || return 1
+  load-db
+  local package entry path maps process pid found readable=0
+  local observed=$TMPD/in-use
+  : > "$observed"
+  # Observational only: never open package files for writing to test a lock.
+  for maps in /proc/[0-9]*/maps
+  do
+    [[ -r $maps ]] || continue
+    (( readable++ ))
+    pid=${maps%/maps}; pid=${pid##*/}
+    while IFS= read -r entry
+    do
+      [[ $entry == /* ]] || continue
+      entry=${entry% (deleted)}
+      path=$(readlink -f -- "$entry") || continue
+      printf '%s\t%s\n' "$path" "$pid" >> "$observed"
+    done < <(gawk '{ sub(/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +/, ""); print }' "$maps" 2>/dev/null)
+    process=/proc/$pid/exe
+    path=$(readlink -f -- "$process" 2>/dev/null) && printf '%s\t%s\n' "$path" "$pid" >> "$observed"
+  done
+  for package in "${pks[@]}"
+  do
+    is-installed "$package" || { warn "$package is not installed"; return 1; }
+    [[ -f $SETUP/$package.lst.gz ]] || { warn "manifest missing: $package"; return 1; }
+    found=0
+    gzip -cd -- "$SETUP/$package.lst.gz" > "$TMPD/busy.manifest" || return 1
+    while IFS= read -r entry
+    do
+      entry=${entry#./}; entry=${entry#/}
+      safe-relative-path "$entry" || continue
+      path=$(readlink -f -- "$ROOT/$entry") || continue
+      while IFS=$'\t' read -r process pid
+      do
+        if [[ $process == "$path" ]]; then printf 'busy\t%s\tpid=%s\t%s\n' "$package" "$pid" "$entry"; found=1; fi
+      done < "$observed"
+    done < "$TMPD/busy.manifest"
+    if (( ! found )); then
+      if (( readable )); then printf 'no-observed-use\t%s\n' "$package"
+      else printf 'unknown\t%s\tprocess maps unavailable\n' "$package"; fi
+    fi
+  done
+  warn 'Observations cover readable process maps only; Windows processes or locks may not be visible.'
+}
+
+function apt-busy { apt-show-packages-busyness; }
+
+function setup-path { printf '%s\n' "$SETUP/setup-bin/setup-$arch.exe"; }
+
+function verify-setup {
+  # Official Setup always requires a signature, independently of --no-verify.
+  local no_verify
+  unset no_verify
+  verify-signature "$1" "$2"
+}
+
+function apt-update-setup {
+  local executable directory candidate=$TMPD/setup.exe
+  executable=$(setup-path); directory=${executable%/*}
+  [[ $arch == x86_64 || $arch == x86 ]] || die 'unsupported Setup architecture'
+  if [[ -v simulate ]]; then printf 'Would download and verify https://cygwin.com/setup-%s.exe to %s\n' "$arch" "$executable"; return 0; fi
+  fetch "https://cygwin.com/setup-$arch.exe" "$candidate" || return 1
+  fetch "https://cygwin.com/setup-$arch.exe.sig" "$candidate.sig" || return 1
+  verify-setup "$candidate" "$candidate.sig" || return 1
+  [[ $(head -c 2 "$candidate") == MZ ]] || { warn 'Setup download is not a Windows executable'; return 1; }
+  mkdir -p -- "$directory" || return 1
+  cp -- "$candidate" "$executable.new.$$" && chmod 755 "$executable.new.$$" || return 1
+  cp -- "$candidate.sig" "$executable.sig.new.$$" || return 1
+  mv -f -- "$executable.sig.new.$$" "$executable.sig" && mv -f -- "$executable.new.$$" "$executable" || return 1
+  printf 'Updated and verified %s\n' "$executable"
+}
+
+function apt-setup {
+  local executable target argument
+  for argument in "${pks[@]}"
+  do
+    case $argument in --r|--ro|--roo|--root|--r=*|--ro=*|--roo=*|--root=*|-R*|-[^-]*R*) die 'Setup root overrides are not allowed; the active Cygwin root is used' ;; esac
+  done
+  executable=$(setup-path)
+  if [[ -v simulate ]]; then printf 'Would verify and launch %s for root %s with arguments:' "$executable" "${ROOT:-/}"; printf ' %q' "${pks[@]}"; echo; return 0; fi
+  [[ $(uname -s) == CYGWIN* ]] && command -v cygpath >/dev/null || die 'Setup must be launched from native Cygwin'
+  if [[ ! -f $executable ]]; then apt-update-setup || return 1; fi
+  verify-setup "$executable" "$executable.sig" || return 1
+  target=$(cygpath -aw "${ROOT:-/}") || return 1
+  warn "Launching official Setup for $target; close other Cygwin applications before runtime updates."
+  "$executable" "${pks[@]}" --root "$target" --wait
+}
+
+function apt-dist-upgrade {
+  pks=(--upgrade-also "${pks[@]}")
+  apt-setup
+}
+
 # ---------------------------------------------------------------------------
 # process options
 
 command=
+max_jobs=4
+package_files=()
 until (( $# == 0 ))
 do
   case $1 in
+    --files) files=1 ;;
+    --fix) fix=1 ;;
+    --allow-untrusted) allow_untrusted=1 ;;
+    --ignore-case|-i) ignore_case=1 ;;
+    --quiet|-q) quiet=1 ;;
+    --verbose|-v) verbose=1 ;;
+    --no-progress) no_progress=1 ;;
+    --long) long_listing=1 ;;
+    --name|--proxy|--max-jobs|-j|--mirror|-m|--cache|-c|--file|-f)
+      (( $# > 1 )) || die "missing value for $1"
+      case $1 in
+        --name) pkgname=$2 ;;
+        --proxy) proxy_mode=$2 ;;
+        --max-jobs|-j) max_jobs=$2 ;;
+        --mirror|-m) mirror_override=$2 ;;
+        --cache|-c) cache_override=$2 ;;
+        --file|-f) package_files+=("$2") ;;
+      esac
+      shift ;;
+    --name=*) pkgname=${1#*=} ;;
+    --proxy=*) proxy_mode=${1#*=} ;;
+    --max-jobs=*) max_jobs=${1#*=} ;;
     --nodeps)    nodeps=1    ;;
     --noscripts) noscripts=1 ;;
     --no-verify) no_verify=1 ;;
@@ -1826,6 +2340,30 @@ do
   shift
 done
 
+[[ $max_jobs =~ ^[1-9][0-9]?$ ]] && (( max_jobs <= 64 )) || die '--max-jobs must be between 1 and 64'
+[[ ! $pkgname ]] || valid-name "$pkgname" || die 'invalid --name value'
+if [[ -v fix || -v files ]]; then [[ $command == check ]] || die '--fix and --files are only valid with check'; fi
+if [[ -v pkgname || -v allow_untrusted ]]; then [[ $command == localinstall ]] || die '--name and --allow-untrusted are only valid with localinstall'; fi
+for package_file in "${package_files[@]}"
+do
+  [[ -r $package_file ]] || die "cannot read package list: $package_file"
+  while IFS= read -r line || [[ $line ]]
+  do
+    line=${line%$'\r'}
+    [[ ! $line || $line == \#* ]] || pks+=("$line")
+  done < "$package_file"
+done
+case ${proxy_mode:-inherit} in
+  inherit) ;;
+  none) unset http_proxy https_proxy ftp_proxy all_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY ;;
+  http://*|https://*|socks5://*|socks5h://*)
+    export http_proxy=$proxy_mode https_proxy=$proxy_mode ftp_proxy=$proxy_mode all_proxy=$proxy_mode
+    export HTTP_PROXY=$proxy_mode HTTPS_PROXY=$proxy_mode FTP_PROXY=$proxy_mode ALL_PROXY=$proxy_mode
+    unset no_proxy NO_PROXY ;;
+  *) die '--proxy accepts inherit, none, or an http/https/socks5 URL' ;;
+esac
+[[ ! -v quiet ]] || exec 1>/dev/null
+
 # names on a pipe, e.g. cat list.txt | apt-cyg install
 if [[ $command && ${#pks[@]} -eq 0 && -p /dev/stdin ]] && in-list "$command" "$TARGET_COMMANDS"
 then
@@ -1844,21 +2382,25 @@ then
   for package_name in "${pks[@]}"
   do
     case $command in
-      install|upgrade|reinstall|remove|mark-auto|mark-manual)
-        [[ $package_name =~ ^[A-Za-z0-9_+.-]+$ ]] || die "invalid package name: $package_name" ;;
+      install|upgrade|reinstall|remove|mark-auto|mark-manual|check|source|mirror-source|busy|show-packages-busyness)
+        valid-name "$package_name" || die "invalid package name: $package_name" ;;
     esac
   done
-  if in-list "$command" "$MUTATING_COMMANDS" && [[ ! -v simulate ]]
+  if { in-list "$command" "$MUTATING_COMMANDS" || [[ $command == check && -v fix ]]; } && [[ ! -v simulate ]]
   then
     acquire-lock
   fi
   if [[ -v simulate ]]
   then
     case $command in
-      update|mirror|cache|key-add|completion-install|completion-uninstall)
+      update|mirror|cache|key-add|key-del|completion-install|completion-uninstall)
         printf 'Would run %s %s; no configuration or package changes made.\n' "$command" "${pks[*]}"
         exit 0 ;;
     esac
+  fi
+  if [[ -v verbose ]]
+  then
+    printf 'Command: %s; root: %s; database: %s\n' "$command" "${ROOT:-/}" "$DB" >&2
   fi
   "apt-$command"
   exit $?
