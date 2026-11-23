@@ -1,0 +1,19 @@
+name: Regression tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  isolated-fixtures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y gawk gnupg shellcheck xz-utils zstd
+      - name: Check Bash syntax and errors
+        run: |
+          bash -n apt-cyg
+          shellcheck -S error apt-cyg
+      - name: Run isolated package and signature fixtures
+        run: python3 -m unittest discover -s tests -v
