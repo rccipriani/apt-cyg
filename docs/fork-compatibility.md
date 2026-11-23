@@ -27,7 +27,7 @@ notices remain in the installer and LICENSE.
 | mark-auto/manual, mark-showauto/manual | Marking commands plus compatibility aliases for list-auto/manual. |
 | key-add/del/list/finger | Dedicated keyring; removal requires full primary fingerprint. Explicit key refresh preserves custom keys. |
 | upgrade-self | Alias for self-update; TLS, syntax validation, backup and optional completion refresh. |
-| completion-install/uninstall | Includes automatic self-update refresh, persistent opt-out and parsed-subcommand helper. |
+| completion-install/uninstall | Bash and native Zsh definitions; optional apt-cyg-scoped zsh-autosuggestions integration, automatic self-update refresh, persistent opt-out and parsed-subcommand helper. |
 | mirrors-list/long/online | Recorded URLs/details and online official list. |
 | benchmark-mirrors, benchmark-parallel-mirrors, benchmark-parallel-mirrors-list | Sequential or bounded parallel comparisons; no automatic mirror switching. |
 | scriptinfo, pathof | Resolved script/environment paths. pathof mirrors identifies setup.rc, which stores recorded mirror values. |
@@ -102,3 +102,16 @@ the homepage helper follow the normal authenticated source-download path.
 Native Windows ACLs, PE execution and full Windows process visibility still need
 native Cygwin validation. Fixture and live-web tests do not establish those
 platform-specific behaviors.
+
+## Setup/checker and Zsh follow-up
+
+Installed-version matching now accepts Setup's synthetic .tar.bz2 archive suffix
+and architecture-tag variations, using the exact version advertised by signed
+metadata. Missing records for genuinely different versions remain errors.
+Completed one-shot postinstall scripts count as present under their .done names;
+perpetual scripts incorrectly marked .done remain repair diagnostics.
+
+Native Zsh completion and optional zsh-autosuggestions integration are additional
+features beyond the reviewed Bash-completion forks. Completion candidates are
+read-only and offline; Bash completion also handles value-bearing options before
+the operation and forwards cache/mirror overrides to that backend.

@@ -1215,6 +1215,208 @@ printf sample > "$out"''')
         self.assertEqual(self.run_cli("list-desired-packages").stdout.strip(), "app")
         self.assertEqual(self.db.read_bytes(), before)
 
+    def test_setup_legacy_archive_suffix_resolves_current_metadata(self):
+        for index, suffix in enumerate(("", "-x86_64", "-noarch")):
+            name = "legacy" + str(index)
+            archive = self.package(name)
+            self.assert_ok(self.run_install(name))
+            if suffix:
+                renamed = archive.with_name(archive.name.replace(".tar.xz", suffix + ".tar.xz"))
+                archive.rename(renamed)
+                self.metadata[-1] = self.metadata[-1].replace(archive.name, renamed.name)
+            self.db.write_text(self.db.read_text().replace(f"{name}-1.0-1.tar.xz", f"{name}-1.0-1{suffix}.tar.bz2"))
+            (self.setup / f"{name}.deps").unlink()
+            before = self.db.read_bytes()
+            self.assert_ok(self.run_cli("check", "--files"))
+            self.assertEqual(self.db.read_bytes(), before)
+            result = self.run_cli("upgrade", name, "--simulate")
+            self.assert_ok(result)
+            self.assertNotIn("will be upgraded", result.stdout)
+
+    def test_setup_compression_placeholder_reinstall_preserves_version_and_flags(self):
+        self.package("app")
+        self.assert_ok(self.run_install("app"))
+        self.assert_ok(self.run_cli("mark-auto", "app"))
+        self.db.write_text(self.db.read_text().replace("app-1.0-1.tar.xz", "app-1.0-1.tar.bz2"))
+        (self.setup / "app.deps").unlink()
+        (self.root / "bin/app.fixture").unlink()
+        self.assert_ok(self.run_cli("reinstall", "app", "--yes"))
+        self.assertEqual(self.flags()["app"], "0")
+        self.assertTrue((self.root / "bin/app.fixture").exists())
+        self.assertIn("app-1.0-1.tar.xz", self.db.read_text())
+
+    def test_setup_placeholder_selects_previous_version_without_prefix_matching(self):
+        old = self.package("app", version="1.0-1")
+        self.assert_ok(self.run_install("app"))
+        (self.setup / "app.deps").unlink()
+        self.db.write_text(self.db.read_text().replace(old.name, "app-1.0-1.tar.bz2"))
+        previous = self.metadata.pop().split("\n", 1)[1]
+        self.package("app", version="1.0-10", extra="[prev]\n" + previous)
+        self.assert_ok(self.run_cli("check", "--files"))
+        self.assert_ok(self.run_cli("reinstall", "app", "--yes"))
+        self.assertIn("app-1.0-1.tar.xz", self.db.read_text())
+        self.assertNotIn("app-1.0-10.tar.xz", self.db.read_text())
+
+    def test_truly_unavailable_installed_version_stays_unknown(self):
+        self.package("app")
+        self.assert_ok(self.run_install("app"))
+        self.db.write_text(self.db.read_text().replace("app-1.0-1.tar.xz", "app-0.5-1.tar.bz2"))
+        (self.setup / "app.deps").unlink()
+        before = self.db.read_bytes()
+        result = self.run_cli("check", "--files")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installed-version dependency metadata unavailable", result.stderr)
+        self.assertNotEqual(self.run_cli("reinstall", "app").returncode, 0)
+        self.assertEqual(self.db.read_bytes(), before)
+
+    def test_completed_postinstall_scripts_are_present_for_file_checks(self):
+        self.package("app", files={"bin/app.fixture": "app", "etc/postinstall/app.sh": "exit 0\n"})
+        self.assert_ok(self.run_install("app"))
+        for extension in ("dash", "bat", "cmd"):
+            completed = self.postinstall / ("completed." + extension + ".done")
+            completed.write_text("completed\n")
+        manifest = self.setup / "app.lst.gz"
+        raw = gzip.decompress(manifest.read_bytes())
+        raw += b"./etc/postinstall/completed.dash\netc/postinstall/completed.bat\netc/postinstall/completed.cmd\n"
+        manifest.write_bytes(gzip.compress(raw))
+        self.assertFalse((self.postinstall / "app.sh").exists())
+        self.assertTrue((self.postinstall / "app.sh.done").exists())
+        self.assert_ok(self.run_cli("check", "--files"))
+        self.assert_ok(self.run_cli("check", "--files", "--fix", "--simulate"))
+
+    def test_done_suffix_does_not_hide_missing_regular_files_or_scripts(self):
+        self.package("app", files={"bin/app.fixture": "app", "etc/postinstall/app.sh": "exit 0\n"})
+        self.assert_ok(self.run_install("app"))
+        (self.postinstall / "app.sh.done").unlink()
+        original = self.root / "bin/app.fixture"
+        original.rename(Path(str(original) + ".done"))
+        result = self.run_cli("check", "--files")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bin/app.fixture", result.stderr)
+        self.assertIn("etc/postinstall/app.sh", result.stderr)
+
+    def test_perpetual_done_is_still_reported_for_repair(self):
+        self.package("app", files={"etc/postinstall/0p_app.sh": "exit 0\n"})
+        self.assert_ok(self.run_install("app"))
+        active = self.postinstall / "0p_app.sh"
+        active.rename(Path(str(active) + ".done"))
+        result = self.run_cli("check", "--files")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("incorrectly completed perpetual script", result.stderr)
+        self.assertNotIn("missing or invalid file", result.stderr)
+
+    def test_completion_candidates_are_offline_and_do_not_build_indexes(self):
+        self.package("application", extra="category: Text")
+        self.write_metadata()
+        self.mock_downloader("wget", 'touch "$APT_CYG_ROOT/network-called"; exit 1')
+        env = dict(self.env, APT_CYG_KEYRING=str(self.root / "missing-keyring"), APT_CYG_DOWNLOADER="wget")
+        before = self.db.read_bytes()
+        result = self.run_cli("completion-candidates", "available", metadata=False, env=env)
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.strip(), "application")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self.run_cli("completion-candidates", "categories", metadata=False, env=env).stdout.strip(), "Text")
+        self.assertFalse((self.root / "network-called").exists())
+        self.assertFalse((self.workspace / "setup.idx").exists())
+        self.assertEqual(self.db.read_bytes(), before)
+        missing_cache = self.root / "not-created"
+        result = self.run_cli("completion-candidates", "available", "--cache", str(missing_cache), metadata=False, env=env)
+        self.assert_ok(result)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(missing_cache.exists())
+
+    def test_bash_completion_handles_option_values_and_cache_override(self):
+        import shlex
+        self.package("application")
+        self.write_metadata()
+        definition = self.run_cli("completion").stdout
+        def complete(words):
+            command = definition + "\nCOMP_WORDS=(" + " ".join(shlex.quote(x) for x in words) + "); COMP_CWORD=" + str(len(words) - 1)
+            command += '; COMPREPLY=(); _apt_cyg_complete; printf "%s\\n" "${COMPREPLY[@]}"'
+            return subprocess.run(["bash", "-c", command], env=self.env, capture_output=True, text=True, check=True).stdout.splitlines()
+        self.assertIn("application", complete(["apt-cyg", "--proxy", "inherit", "install", "appl"]))
+        alternate = self.root / "alternate cache"
+        destination = alternate / self.mirror_url.replace("/", "%2f").replace(":", "%3a") / "x86_64/setup.ini"
+        destination.parent.mkdir(parents=True)
+        destination.write_text("\n".join(self.metadata).replace("application", "other"))
+        self.assertIn("other", complete(["apt-cyg", "--cache", str(alternate), "install", "oth"]))
+        self.assertIn("zsh", complete(["apt-cyg", "completion-install", "--shell", "z"]))
+
+    def test_zsh_completion_install_uninstall_and_autosuggestion_configuration(self):
+        result = self.run_cli("completion", "--shell", "zsh")
+        self.assert_ok(result)
+        self.assertTrue(result.stdout.startswith("#compdef apt-cyg"))
+        subprocess.run(["zsh", "-n"], input=result.stdout, text=True, check=True, capture_output=True)
+        self.assert_ok(self.run_cli("completion-install", "--shell", "all", "--autosuggestions"))
+        native = self.root / "usr/local/share/zsh/site-functions/_apt-cyg"
+        config = self.root / "usr/local/share/apt-cyg/zsh-autosuggestions.zsh"
+        bash = self.root / "etc/bash_completion.d/apt-cyg"
+        self.assertTrue(native.exists())
+        self.assertTrue(config.exists())
+        self.assertTrue(bash.exists())
+        script = 'ZSH_AUTOSUGGEST_STRATEGY=(history); source "$1"; source "$1"; print -l -- $ZSH_AUTOSUGGEST_STRATEGY'
+        result = subprocess.run(["zsh", "-f", "-c", script, "zsh", str(config)], text=True, capture_output=True, check=True)
+        self.assertEqual(result.stdout.splitlines(), ["history", "apt_cyg"])
+        self.assert_ok(self.run_cli("completion-uninstall", "--shell", "zsh"))
+        self.assertFalse(native.exists())
+        self.assertFalse(config.exists())
+        self.assertTrue(bash.exists())
+
+    def test_zsh_inline_strategy_is_scoped_to_apt_cyg(self):
+        config = self.root / "suggestions.zsh"
+        config.write_text(self.run_cli("autosuggestions").stdout)
+        script = '''source "$1"
+_zsh_autosuggest_strategy_completion() { typeset -g suggestion="$1lication"; }
+_zsh_autosuggest_strategy_apt_cyg 'apt-cyg install app'
+print -r -- "$suggestion"
+suggestion=''
+_zsh_autosuggest_strategy_apt_cyg 'git status'
+print -r -- "unrelated=$suggestion"
+'''
+        result = subprocess.run(["zsh", "-f", "-c", script, "zsh", str(config)], text=True, capture_output=True, check=True)
+        self.assertEqual(result.stdout.splitlines(), ["apt-cyg install application", "unrelated="])
+
+    def test_interactive_zsh_completes_packages_after_global_option_values(self):
+        import pexpect
+        import shlex
+        self.package("application")
+        self.write_metadata()
+        self.assert_ok(self.run_cli("completion-install", "--shell", "zsh"))
+        child = pexpect.spawn("zsh", ["-f"], env=dict(self.env, TERM="xterm"), encoding="utf-8", timeout=20, dimensions=(40, 180))
+        try:
+            directory = self.root / "usr/local/share/zsh/site-functions"
+            command = "PROMPT='APTTEST> '; fpath=(" + shlex.quote(str(directory)) + " $fpath); autoload -Uz compinit; compinit -u -d " + shlex.quote(str(self.root / "zcompdump"))
+            command += "; _capture_apt() { print -r -- \"$BUFFER\" > \"$APT_CYG_ROOT/completion.buffer\"; zle send-break; }; zle -N _capture_apt; bindkey '^X' _capture_apt; print READY"
+            child.sendline(command)
+            child.expect_exact("READY\r\n")
+            child.expect_exact("APTTEST> ")
+            child.send("apt-cyg --proxy inherit install appl\t\x18")
+            child.expect_exact("APTTEST> ")
+            self.assertEqual((self.root / "completion.buffer").read_text().strip(), "apt-cyg --proxy inherit install application")
+        finally:
+            child.sendcontrol("c")
+            child.sendline("exit")
+            child.close(force=True)
+
+    def test_self_update_refreshes_bash_zsh_and_inline_integration(self):
+        self.assert_ok(self.run_cli("completion-install", "--shell", "all", "--autosuggestions"))
+        candidate = self.root / "update.fixture"
+        candidate.write_bytes(self.executable.read_bytes())
+        self.mock_downloader("wget", 'while (( $# )); do if [[ $1 == -O ]]; then out=$2; shift; fi; shift; done\ncp "$UPDATE_FIXTURE" "$out"')
+        env = dict(self.env, APT_CYG_DOWNLOADER="wget", UPDATE_FIXTURE=str(candidate))
+        self.assert_ok(self.run_cli("self-update", env=env))
+        paths = ("etc/bash_completion.d/apt-cyg", "usr/local/share/zsh/site-functions/_apt-cyg", "usr/local/share/apt-cyg/zsh-autosuggestions.zsh")
+        for relative in paths:
+            self.assertTrue(Path(str(self.root / relative) + ".bak").exists())
+
+    def test_local_archive_architecture_suffix_does_not_change_package_name(self):
+        archive = self.package("my-app")
+        renamed = archive.with_name(archive.name.replace(".tar.xz", "-x86_64.tar.xz"))
+        archive.rename(renamed)
+        self.metadata[-1] = self.metadata[-1].replace(archive.name, renamed.name)
+        self.assert_ok(self.run_cli("localinstall", str(renamed), "--yes"))
+        self.assertEqual(self.flags(), {"my-app": "1"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,8 @@ DESCRIPTION
   line arguments, or one per line on a pipe.
 
 OPERATIONS
+  completion-candidates  Read offline package/category/command candidates.
+  autosuggestions  Print optional apt-cyg-only zsh-autosuggestions integration.
   repair-postinstall  Restore perpetual scripts incorrectly marked .done.
   repair-acl    Back up ACLs and repair owner access on explicit paths only.
   packageof     Search the cached installed-file ownership index (regexp).
@@ -124,6 +126,9 @@ OPERATIONS
   completion-uninstall  Remove the installed Bash completion script.
 
 OPTIONS
+  --shell bash|zsh|all  Select completion install/uninstall shell (default bash).
+                       completion output accepts bash or zsh.
+  --autosuggestions    Also install optional Zsh inline-suggestion integration.
   --ipv4, -4            Force IPv4 with wget/curl.
   --noupdate, -u        Use verified cached metadata; web queries stay offline.
   --no-header           Suppress dependency-difference table headers.
@@ -179,7 +184,7 @@ Copyright (c) 2013 Trans-code Design
 Copyright (c) 2026 ZenSage Design
 "
 
-COMMANDS='help repair-postinstall repair-acl packageof filelist filesearch list-desired-packages list-required-packages list-orphaned-packages list-lacked-packages list-installed-packages list-overages-and-shortages-of-packages browse-summary browse-homepage browse-homepage-with-mirror-source get-proxy setuprc-get ls-pkg-with-category set-cache set-mirror mark-showauto mark-showmanual call time
+COMMANDS='completion-candidates autosuggestions help repair-postinstall repair-acl packageof filelist filesearch list-desired-packages list-required-packages list-orphaned-packages list-lacked-packages list-installed-packages list-overages-and-shortages-of-packages browse-summary browse-homepage browse-homepage-with-mirror-source get-proxy setuprc-get ls-pkg-with-category set-cache set-mirror mark-showauto mark-showmanual call time
   check localinstall setup update-setup dist-upgrade show-packages-busyness busy source mirror-source key-del key-finger pathof stats packages-total-count packages-total-size packages-cached-count packages-cached-size describe find ls-categories scriptinfo mirrors-list-online mirrors-list-long benchmark-parallel-mirrors benchmark-parallel-mirrors-list
   mark-auto mark-manual list-auto list-manual key-add key-list
   self-update upgrade-self benchmark-mirrors mirrors-list completion
@@ -526,7 +531,9 @@ function find-workspace {
   mirrorurl=${mirror%/}
   cachedir=$cache/$mirrordir
   archdir=$cachedir/$arch
-  mkdir -p -- "$archdir" || die "cannot create $archdir"
+  if [[ $completion_readonly ]]
+  then [[ -d $archdir ]] || return 1
+  else mkdir -p -- "$archdir" || die "cannot create $archdir"; fi
   if [[ ! -s $archdir/setup.ini && ! $no_auto_setup ]]
   then
     [[ ! -v noupdate ]] || die 'cached metadata is missing (--noupdate)'
@@ -669,11 +676,20 @@ function reset_version() {
   file = size = hash = ver = req = relation = srfile = srsize = srhash = ""
   modern_seen = 0
 }
+function installed_version_matches(    stem, expected) {
+  if (ENVIRON["wanted_version_match"] != "1" || ver == "") return 0
+  stem = ENVIRON["wanted_archive"]
+  sub(/^.*\//, "", stem)
+  if (!sub(/\.tar\.[[:alnum:]]+$/, "", stem)) return 0
+  expected = name "-" ver
+  return stem == expected || stem == expected "-" ENVIRON["wanted_arch"] || stem == expected "-noarch"
+}
 function version_flush(    filename, dependencies, raw) {
   if (file == "") return
   filename = file
   sub(/^.*\//, "", filename)
-  if ((ENVIRON["wanted_archive"] != "" && name == ENVIRON["wanted_package"] && filename == ENVIRON["wanted_archive"]) ||
+  if ((ENVIRON["wanted_archive"] != "" && name == ENVIRON["wanted_package"] &&
+       (filename == ENVIRON["wanted_archive"] || installed_version_matches())) ||
       (ENVIRON["wanted_archive"] == "" && curr)) {
     raw = modern_seen ? relation : (req != "" ? req : base_requires)
     dependencies = deplist(raw)
@@ -725,7 +741,7 @@ END { flush() }
 
 function select-installed-version {
   local p=$1 record n f size h v d c relation sf ss sh
-  record=$(wanted_package="$p" wanted_archive="${INST_FILE[$p]}" gawk "$IDX_AWK" "$archdir/setup.ini" | tail -n +2)
+  record=$(wanted_package="$p" wanted_archive="${INST_FILE[$p]}" wanted_version_match=1 wanted_arch="$arch" gawk "$IDX_AWK" "$archdir/setup.ini" | tail -n +2)
   [[ $record ]] || { warn "authenticated metadata for installed version of $p is unavailable; use Cygwin Setup"; return 1; }
   IFS='|' read -r n f size h v d c relation sf ss sh <<< "$record"
   IDX_FILE[$p]=$f
@@ -834,13 +850,13 @@ function load-installed-dependencies {
     then
       INST_DEPS[$p]=$(tail -n +2 -- "$SETUP/$p.deps")
       INST_KNOWN[$p]=1
-    elif [[ ${INST_FILE[$p]} == "${IDX_FILE[$p]##*/}" && -n ${IDX_FILE[$p]} ]]
+    elif installed-is-current "$p"
     then
       INST_DEPS[$p]=${IDX_DEPS[$p]}
       INST_KNOWN[$p]=1
     elif [[ $INDEX_LOADED ]]
     then
-      deps=$(wanted_package="$p" wanted_archive="${INST_FILE[$p]}" gawk "$IDX_AWK" "$archdir/setup.ini" | tail -n +2)
+      deps=$(wanted_package="$p" wanted_archive="${INST_FILE[$p]}" wanted_version_match=1 wanted_arch="$arch" gawk "$IDX_AWK" "$archdir/setup.ini" | tail -n +2)
       if [[ $deps ]]
       then
         IFS="|" read -r _ _ _ _ _ deps _ <<< "$deps"
@@ -869,16 +885,33 @@ function is-installed {
 }
 
 function file-version {
-  # file-version PKG FILE: pkg-1.2-3.tar.xz -> 1.2-3
+  # Setup stores a legacy .tar.bz2 suffix regardless of actual compression.
   local b=${2##*/}
   b=${b%.tar.*}
-  echo "${b#"$1"-}"
+  b=${b#"$1"-}
+  b=${b%-$arch}
+  b=${b%-noarch}
+  printf '%s\n' "$b"
+}
+
+function archive-has-version {
+  local package=$1 archive=${2##*/} version=$3 stem
+  [[ $version && $archive == *.tar.* ]] || return 1
+  stem=${archive%.tar.*}
+  [[ $stem == "$package-$version" || $stem == "$package-$version-$arch" || $stem == "$package-$version-noarch" ]]
+}
+
+function installed-is-current {
+  local package=$1
+  is-installed "$package" && in-index "$package" || return 1
+  if [[ ${IDX_VER[$package]} ]]
+  then archive-has-version "$package" "${INST_FILE[$package]}" "${IDX_VER[$package]}"
+  else [[ ${INST_FILE[$package]} == "${IDX_FILE[$package]##*/}" ]]; fi
 }
 
 function is-upgradable {
-  # setup.exe semantics: "current" differs from what is installed
-  is-installed "$1" && in-index "$1" &&
-    [[ ${INST_FILE[$1]} != "${IDX_FILE[$1]##*/}" ]]
+  # Compare package versions, not Setup legacy suffixes or architecture tags.
+  is-installed "$1" && in-index "$1" && ! installed-is-current "$1"
 }
 
 function sorted-installed {
@@ -1870,25 +1903,38 @@ function apt-self-update {
     return 0
   fi
   [[ ! -v no_check_certificate ]] || die 'self-update requires TLS certificate verification'
-  local candidate=$TMPD/apt-cyg.new mode completion=$ROOT/etc/bash_completion.d/apt-cyg
-  local completion_candidate=$TMPD/completion.new
+  local candidate=$TMPD/apt-cyg.new mode destination shell stage kind i
+  local -a destinations=() stages=() arguments=()
   fetch "$SELF_UPDATE_URL" "$candidate" || return 1
   head -n 1 "$candidate" | grep -qx '#!/bin/bash' || { warn 'invalid update script'; return 1; }
   bash -n "$candidate" || return 1
-  if [[ -f $completion && ! -f $SETUP/apt-cyg-completion.no-autoupdate && ! -v disable_completion_autoupdate ]]
+  if [[ ! -f $SETUP/apt-cyg-completion.no-autoupdate && ! -v disable_completion_autoupdate ]]
   then
-    bash "$candidate" completion > "$completion_candidate" && bash -n "$completion_candidate" || return 1
+    for kind in bash zsh autosuggestions
+    do
+      case $kind in
+        bash) destination=$ROOT/etc/bash_completion.d/apt-cyg; shell=bash; arguments=(completion --shell bash) ;;
+        zsh) destination=$ROOT/usr/local/share/zsh/site-functions/_apt-cyg; shell=zsh; arguments=(completion --shell zsh) ;;
+        autosuggestions) destination=$ROOT/usr/local/share/apt-cyg/zsh-autosuggestions.zsh; shell=zsh; arguments=(autosuggestions) ;;
+      esac
+      [[ -f $destination ]] || continue
+      stage=$TMPD/completion.$kind.new
+      bash "$candidate" "${arguments[@]}" > "$stage" && validate-completion "$shell" "$stage" || return 1
+      destinations+=("$destination"); stages+=("$stage")
+    done
   fi
   mode=$(stat -c %a -- "$SELF") || return 1
   cp -p -- "$SELF" "$SELF.bak" || return 1
   cp -- "$candidate" "$SELF.new.$$" || return 1
   chmod "$mode" "$SELF.new.$$" || return 1
   mv -f -- "$SELF.new.$$" "$SELF" || return 1
-  if [[ -f $completion_candidate ]]
-  then
-    cp -p -- "$completion" "$completion.bak" && cp -- "$completion_candidate" "$completion.tmp.$$" && mv -f -- "$completion.tmp.$$" "$completion" || return 1
-    echo "Refreshed Bash completion at $completion"
-  fi
+  for (( i=0; i<${#destinations[@]}; i++ ))
+  do
+    destination=${destinations[i]}
+    mode=$(stat -c %a -- "$destination") || return 1
+    cp -p -- "$destination" "$destination.bak" && cp -- "${stages[i]}" "$destination.tmp.$$" && chmod "$mode" "$destination.tmp.$$" && mv -f -- "$destination.tmp.$$" "$destination" || return 1
+    printf 'Refreshed shell integration at %s\n' "$destination"
+  done
   echo "Updated $SELF; previous version saved at $SELF.bak"
 }
 
@@ -1896,48 +1942,225 @@ function apt-upgrade-self {
   apt-self-update
 }
 
-function apt-completion {
-  cat <<'COMPLETION'
-# Bash completion for apt-cyg. Source this file from Bash.
+function apt-completion-candidates {
+  # Diagnostic candidates only: never fetch, verify, rebuild caches, or load dependencies.
+  local kind=${pks[0]:-available} index
+  case $kind in
+    commands) printf '%s\n' $COMMANDS; return 0 ;;
+    installed)
+      [[ -f $DB ]] || return 0
+      gawk 'NR > 1 && $1 ~ /^[A-Za-z0-9_+.-]+$/ && $1 != "." && $1 != ".." { print $1 }' "$DB" | LC_ALL=C sort -u
+      return $? ;;
+    available|categories) ;;
+    *) die 'candidate kind must be commands, installed, available or categories' ;;
+  esac
+  completion_readonly=1 no_auto_setup=1 find-workspace soft >/dev/null 2>&1 || return 0
+  index=$archdir/setup.idx
+  if [[ -s $index && ! $archdir/setup.ini -nt $index && $(head -n 1 "$index") == "$IDX_MAGIC" ]]
+  then cat -- "$index"
+  elif [[ -s $archdir/setup.ini ]]; then gawk "$IDX_AWK" "$archdir/setup.ini"
+  else return 0; fi |
+    kind=$kind gawk -F'|' '
+      NR > 1 {
+        if (ENVIRON["kind"] == "categories") {
+          n=split($7,a," "); for(i=1;i<=n;i++) if(a[i] ~ /^[A-Za-z0-9_+.-]+$/) print a[i]
+        } else if($1 ~ /^[A-Za-z0-9_+.-]+$/ && $1 != "." && $1 != "..") print $1
+      }
+    ' | LC_ALL=C sort -u
+}
+
+function completion-bash {
+  local definition
+  definition=$(cat <<'BASH_COMPLETION'
+# Bash completion for apt-cyg. Package queries use cached metadata only.
 _apt_cyg_complete() {
-  local word=${COMP_WORDS[COMP_CWORD]} operation= item
-  local commands='help repair-postinstall repair-acl packageof filelist filesearch list-desired-packages list-required-packages list-orphaned-packages list-lacked-packages list-installed-packages list-overages-and-shortages-of-packages browse-summary browse-homepage browse-homepage-with-mirror-source get-proxy setuprc-get ls-pkg-with-category set-cache set-mirror mark-showauto mark-showmanual call time check localinstall setup update-setup dist-upgrade show-packages-busyness busy source mirror-source key-del key-finger pathof stats packages-total-count packages-total-size packages-cached-count packages-cached-size describe find ls-categories scriptinfo mirrors-list-online mirrors-list-long benchmark-parallel-mirrors benchmark-parallel-mirrors-list install upgrade reinstall remove autoremove update download show depends rdepends list listall category listfiles search searchall mirror cache mark-auto mark-manual list-auto list-manual key-add key-list self-update upgrade-self benchmark-mirrors mirrors-list completion completion-install completion-uninstall'
-  local options='--no-user-picked --use-setuprc --ag --refresh --ipv4 --noupdate --no-header --no-check-certificate --no-update-setup --force-remove --force-fetch-trustedkeys --force-update-packageof-cache --completion-disable-autoupdate --completion-get-subcommand --mirror-index --benchmark-timeout --files --fix --allow-untrusted --ignore-case --quiet --verbose --no-progress --long --proxy --file --name --max-jobs --mirror --cache --simulate --dry-run --yes --nodeps --noscripts --no-verify --force --help --version'
-  for item in "${COMP_WORDS[@]:1:COMP_CWORD-1}"
+  local word=${COMP_WORDS[COMP_CWORD]} operation= item expect= end_options= kind= output= i
+  local commands='@COMMANDS@'
+  local options='--shell --autosuggestions --simulate --dry-run --yes --nodeps --noscripts --no-verify --force --no-user-picked --use-setuprc --ag --refresh --ipv4 --noupdate --no-header --no-check-certificate --no-update-setup --force-remove --force-fetch-trustedkeys --force-update-packageof-cache --completion-disable-autoupdate --completion-get-subcommand --mirror-index --benchmark-timeout --files --fix --allow-untrusted --ignore-case --quiet --verbose --no-progress --long --proxy --file --name --max-jobs --mirror --cache --help --version'
+  local -a query=()
+  COMPREPLY=()
+  for (( i=1; i<COMP_CWORD; i++ ))
   do
-    [[ $item == -* ]] || { operation=$item; break; }
+    item=${COMP_WORDS[i]}
+    if [[ $expect ]]
+    then
+      case $expect in --cache|-c) query+=(--cache "$item") ;; --mirror|-m) query+=(--mirror "$item") ;; --mirror-index|-M) query+=(--mirror-index "$item") ;; esac
+      expect=; continue
+    fi
+    if [[ ! $end_options ]]
+    then
+      case $item in
+        --) end_options=1; continue ;;
+        --cache|-c|--mirror|-m|--mirror-index|-M|--proxy|-p|--file|-f|--name|--max-jobs|-j|--benchmark-timeout|--shell) expect=$item; continue ;;
+        --cache=*|--mirror=*|--mirror-index=*) query+=("$item"); continue ;;
+        -*) continue ;;
+      esac
+    fi
+    [[ $operation ]] || operation=$item
   done
-  if [[ $word == -* ]]
+  if [[ $expect ]]
   then
-    mapfile -t COMPREPLY < <(compgen -W "$options" -- "$word")
-  elif [[ ! $operation ]]
-  then
-    mapfile -t COMPREPLY < <(compgen -W "$commands" -- "$word")
-  else
-    case $operation in
-      remove|reinstall|mark-auto|mark-manual|busy|show-packages-busyness|check)
-        mapfile -t COMPREPLY < <(compgen -W "$(apt-cyg list 2>/dev/null)" -- "$word") ;;
-      filelist|browse-summary|browse-homepage|browse-homepage-with-mirror-source|install|upgrade|download|source|mirror-source|show|depends|rdepends)
-        mapfile -t COMPREPLY < <(compgen -W "$(apt-cyg listall '.*' 2>/dev/null)" -- "$word") ;;
+    case $expect in
+      --shell) mapfile -t COMPREPLY < <(compgen -W 'bash zsh all' -- "$word") ;;
+      --proxy|-p) mapfile -t COMPREPLY < <(compgen -W 'inherit none' -- "$word") ;;
+      --cache|-c) mapfile -t COMPREPLY < <(compgen -d -- "$word") ;;
+      --file|-f) mapfile -t COMPREPLY < <(compgen -f -- "$word") ;;
     esac
+    return 0
   fi
+  if [[ $word == -* && ! $end_options ]]
+  then mapfile -t COMPREPLY < <(compgen -W "$options" -- "$word"); return 0; fi
+  if [[ ! $operation || $operation == call || $operation == time ]]
+  then mapfile -t COMPREPLY < <(compgen -W "$commands" -- "$word"); return 0; fi
+  case $operation in
+    remove|reinstall|upgrade|mark-auto|mark-manual|busy|show-packages-busyness|check|list) kind=installed ;;
+    install|download|source|mirror-source|show|depends|rdepends|listall|find|describe|filelist|browse-*) kind=available ;;
+    category) kind=categories ;;
+    localinstall|key-add|repair-acl) mapfile -t COMPREPLY < <(compgen -f -- "$word"); return 0 ;;
+    completion-candidates) mapfile -t COMPREPLY < <(compgen -W 'available installed categories commands' -- "$word"); return 0 ;;
+    pathof) mapfile -t COMPREPLY < <(compgen -W 'root cache mirror mirrors mirrordir setup.ini database keyring setup' -- "$word"); return 0 ;;
+    *) return 0 ;;
+  esac
+  output=$(command apt-cyg "${query[@]}" completion-candidates "$kind" 2>/dev/null) || return 0
+  mapfile -t COMPREPLY < <(compgen -W "$output" -- "$word")
 }
 complete -F _apt_cyg_complete apt-cyg
-COMPLETION
+BASH_COMPLETION
+)
+  printf '%s\n' "${definition//@COMMANDS@/${COMMANDS//$'\n'/ }}"
+}
+
+function completion-zsh {
+  local definition
+  definition=$(cat <<'ZSH_COMPLETION'
+#compdef apt-cyg
+# Native Zsh completion. Candidate queries never refresh repository metadata.
+local context state state_descr line operation item output kind
+local -A opt_args
+local -a operations=(@COMMANDS@) candidates query=()
+_arguments -C -s \
+  '--shell=[completion shell]:shell:(bash zsh all)' \
+  '--autosuggestions[install optional Zsh autosuggestions integration]' \
+  '--cache=[temporary cache override]:cache directory:_directories' '-c[temporary cache override]:cache directory:_directories' \
+  '--mirror=[temporary mirror override]:mirror URL:_urls' '-m[temporary mirror override]:mirror URL:_urls' \
+  '--mirror-index=[saved mirror index]:index:' '-M[saved mirror index]:index:' \
+  '--proxy=[proxy policy or URL]:proxy:(inherit none)' '-p[proxy policy or URL]:proxy:(inherit none)' \
+  '*--file=[read targets from file]:file:_files' '*-f[read targets from file]:file:_files' \
+  '--name=[local package name]:name:' '--max-jobs=[parallel workers]:workers:(1 2 4 8 16)' '-j[parallel workers]:workers:(1 2 4 8 16)' \
+  '--benchmark-timeout=[request timeout]:seconds:' \
+  '--simulate[show plan without changing packages]' '--dry-run[show plan]' '-s[show plan]' \
+  '--yes[skip confirmation]' '-y[skip confirmation]' '--nodeps[skip dependencies]' '--noscripts[skip package scripts]' \
+  '--no-verify[explicit metadata signature bypass]' '-X[metadata signature bypass]' '--force[override dependent removal guard]' \
+  '--no-user-picked[mark requested packages automatic]' '--use-setuprc[obsolete compatibility option]' \
+  '--ag[use optional silver searcher]' '--refresh[refresh web diagnostic caches]' \
+  '--ipv4[force IPv4]' '-4[force IPv4]' '--noupdate[use cached metadata only]' '-u[use cached metadata only]' \
+  '--no-header[omit difference table header]' '--no-check-certificate[explicit TLS bypass]' '--no-update-setup[require cached Setup]' \
+  '--force-remove[override dependent removal guard]' '--force-fetch-trustedkeys[refresh pinned Cygwin key]' \
+  '--force-update-packageof-cache[rebuild owner index]' '--completion-disable-autoupdate[disable completion refresh]' \
+  '--completion-get-subcommand[print parsed operation]' '--files[check installed file presence]' '--fix[repair check failures]' \
+  '--allow-untrusted[explicitly trust a private local archive]' '--ignore-case[ignore case in queries]' '-i[ignore case]' \
+  '--quiet[suppress stdout]' '-q[suppress stdout]' '--verbose[show diagnostics]' '-v[show diagnostics]' \
+  '--no-progress[disable progress bars]' '--long[full mirror records]' \
+  '--help[show help]' '-h[show help]' '--version[show version]' \
+  '1:operation:->operation' '*:target:->targets' && return 0
+case $state in
+  operation) _describe 'apt-cyg operation' operations; return ;;
+  targets) operation=$line[1] ;;
+  *) return 0 ;;
+esac
+for item in --cache -c --mirror -m --mirror-index -M
+do
+  [[ -z ${opt_args[$item]} ]] || query+=("$item" "${opt_args[$item]}")
+done
+case $operation in
+  remove|reinstall|upgrade|mark-auto|mark-manual|busy|show-packages-busyness|check|list) kind=installed ;;
+  install|download|source|mirror-source|show|depends|rdepends|listall|find|describe|filelist|browse-*) kind=available ;;
+  category) kind=categories ;;
+  localinstall|key-add|repair-acl) _files; return ;;
+  call|time) _describe 'apt-cyg operation' operations; return ;;
+  completion-candidates) candidates=(available installed categories commands); compadd -a candidates; return ;;
+  pathof) candidates=(root cache mirror mirrors mirrordir setup.ini database keyring setup); compadd -a candidates; return ;;
+  *) return 0 ;;
+esac
+output=$(command apt-cyg "${query[@]}" completion-candidates "$kind" 2>/dev/null) || return 0
+candidates=("${(@f)output}")
+(( ${#candidates} )) && compadd -a candidates
+ZSH_COMPLETION
+)
+  printf '%s\n' "${definition//@COMMANDS@/${COMMANDS//$'\n'/ }}"
+}
+
+function apt-autosuggestions {
+  cat <<'ZSH_AUTOSUGGESTIONS'
+# Source from .zshrc alongside zsh-users/zsh-autosuggestions and native apt-cyg completion.
+# This adds completion-based suggestions for apt-cyg only; existing strategies are retained.
+_zsh_autosuggest_strategy_apt_cyg() {
+  emulate -L zsh
+  local first=${1%%[[:space:]]*}
+  [[ ${first:t} == apt-cyg ]] || return 1
+  (( $+functions[_zsh_autosuggest_strategy_completion] )) || return 1
+  _zsh_autosuggest_strategy_completion "$1"
+}
+if (( ! ${+ZSH_AUTOSUGGEST_STRATEGY} )); then
+  typeset -ga ZSH_AUTOSUGGEST_STRATEGY=(history)
+else
+  typeset -ga ZSH_AUTOSUGGEST_STRATEGY
+fi
+if (( ! ${ZSH_AUTOSUGGEST_STRATEGY[(Ie)apt_cyg]} )); then
+  ZSH_AUTOSUGGEST_STRATEGY+=(apt_cyg)
+fi
+ZSH_AUTOSUGGESTIONS
+}
+
+function apt-completion {
+  case ${completion_shell:-bash} in
+    bash) completion-bash ;;
+    zsh) completion-zsh ;;
+    *) die 'completion output requires --shell bash or --shell zsh' ;;
+  esac
+}
+
+function validate-completion {
+  local shell=$1 file=$2
+  command -v "$shell" >/dev/null || { warn "$shell is required to validate its completion file"; return 1; }
+  "$shell" -n "$file"
 }
 
 function apt-completion-install {
-  local destination=$ROOT/etc/bash_completion.d/apt-cyg
-  mkdir -p -- "${destination%/*}" || return 1
-  apt-completion > "$destination.tmp.$$" || return 1
-  mv -f -- "$destination.tmp.$$" "$destination" || return 1
+  local shell destination staging
+  local -a shells=("${completion_shell:-bash}")
+  [[ ${completion_shell:-bash} != all ]] || shells=(bash zsh)
+  for shell in "${shells[@]}"
+  do
+    if [[ $shell == bash ]]; then destination=$ROOT/etc/bash_completion.d/apt-cyg
+    else destination=$ROOT/usr/local/share/zsh/site-functions/_apt-cyg; fi
+    staging=$TMPD/completion.$shell
+    "completion-$shell" > "$staging" && validate-completion "$shell" "$staging" || return 1
+    mkdir -p -- "${destination%/*}" || return 1
+    cp -- "$staging" "$destination.tmp.$$" && chmod 644 "$destination.tmp.$$" && mv -f -- "$destination.tmp.$$" "$destination" || return 1
+    printf 'Installed %s completion at %s\n' "$shell" "$destination"
+  done
+  if [[ -v with_autosuggestions ]]
+  then
+    destination=$ROOT/usr/local/share/apt-cyg/zsh-autosuggestions.zsh
+    staging=$TMPD/autosuggestions.zsh
+    apt-autosuggestions > "$staging" && validate-completion zsh "$staging" || return 1
+    mkdir -p -- "${destination%/*}" || return 1
+    cp -- "$staging" "$destination.tmp.$$" && chmod 644 "$destination.tmp.$$" && mv -f -- "$destination.tmp.$$" "$destination" || return 1
+    printf 'Installed optional integration; source %s from .zshrc after loading zsh-autosuggestions.\n' "$destination"
+  fi
   if [[ -v disable_completion_autoupdate ]]; then : > "$SETUP/apt-cyg-completion.no-autoupdate" || return 1
   else rm -f -- "$SETUP/apt-cyg-completion.no-autoupdate" || return 1; fi
-  echo "Installed Bash completion at $destination"
 }
 
 function apt-completion-uninstall {
-  rm -f -- "$ROOT/etc/bash_completion.d/apt-cyg" "$SETUP/apt-cyg-completion.no-autoupdate"
+  case ${completion_shell:-bash} in
+    bash) rm -f -- "$ROOT/etc/bash_completion.d/apt-cyg" || return 1 ;;
+    zsh) rm -f -- "$ROOT/usr/local/share/zsh/site-functions/_apt-cyg" "$ROOT/usr/local/share/apt-cyg/zsh-autosuggestions.zsh" || return 1 ;;
+    all) rm -f -- "$ROOT/etc/bash_completion.d/apt-cyg" "$ROOT/usr/local/share/zsh/site-functions/_apt-cyg" "$ROOT/usr/local/share/apt-cyg/zsh-autosuggestions.zsh" || return 1 ;;
+  esac
+  if [[ ! -f $ROOT/etc/bash_completion.d/apt-cyg && ! -f $ROOT/usr/local/share/zsh/site-functions/_apt-cyg ]]
+  then rm -f -- "$SETUP/apt-cyg-completion.no-autoupdate"; fi
 }
 
 # Additional operations integrated into the single-file installer.
@@ -1948,6 +2171,15 @@ function valid-name {
 
 function safe-relative-path {
   [[ $1 && $1 != /* && /$1/ != */../* && $1 != *$'\n'* && $1 != *\\* ]]
+}
+
+function completed-postinstall-file {
+  local entry=$1 script
+  case $entry in etc/postinstall/*.sh|etc/postinstall/*.dash|etc/postinstall/*.bat|etc/postinstall/*.cmd) ;;
+    *) return 1 ;;
+  esac
+  script=${entry#etc/postinstall/}
+  [[ $script != */* && ( -f $ROOT/$entry.done || -L $ROOT/$entry.done ) ]]
 }
 
 function validate-database {
@@ -1981,7 +2213,9 @@ function check-scan {
       do
         entry=${entry#./}; entry=${entry#/}
         [[ ! $entry || $entry == */ ]] && continue
-        if ! safe-relative-path "$entry" || [[ ! -e $ROOT/$entry && ! -L $ROOT/$entry ]]
+        if ! safe-relative-path "$entry" || {
+          [[ ! -e $ROOT/$entry && ! -L $ROOT/$entry ]] && ! completed-postinstall-file "$entry"
+        }
         then
           warn "$p: missing or invalid file: $entry"
           bad=1
@@ -2068,7 +2302,7 @@ function apt-localinstall {
   find-workspace
   load-index
   load-db
-  local input archive base name record n f sz hash ver deps cats relation sf ss sh hint raw
+  local input archive base stem name record n f sz hash ver deps cats relation sf ss sh hint raw
   local -a names=()
   declare -A local_seen
   for input in "${pks[@]}"
@@ -2076,8 +2310,9 @@ function apt-localinstall {
     [[ -f $input ]] || { warn "archive not found: $input"; return 1; }
     base=${input##*/}
     [[ $base =~ ^[A-Za-z0-9_+.:~.-]+\.tar\.[A-Za-z0-9]+$ ]] || { warn "invalid archive filename: $base"; return 1; }
+    stem=${base%.tar.*}; stem=${stem%-$arch}; stem=${stem%-noarch}
     if [[ $pkgname ]]; then name=$pkgname
-    elif [[ $base =~ ^(.+)-[^-]+-[^-]+\.tar\.[[:alnum:]]+$ ]]; then name=${BASH_REMATCH[1]}
+    elif [[ $stem =~ ^(.+)-[^-]+-[^-]+$ ]]; then name=${BASH_REMATCH[1]}
     else warn "cannot determine package name: $base; use --name"; return 1; fi
     valid-name "$name" || die "invalid package name: $name"
     [[ ! ${local_seen[$name]} ]] || die "multiple local archives supplied for $name"
@@ -2811,6 +3046,8 @@ function apt-call {
   [[ ! $mirror_override ]] || options+=(--mirror "$mirror_override")
   [[ ! $cache_override ]] || options+=(--cache "$cache_override")
   [[ ! $pkgname ]] || options+=(--name "$pkgname")
+  [[ ! $completion_shell ]] || options+=(--shell "$completion_shell")
+  [[ ! -v with_autosuggestions ]] || options+=(--autosuggestions)
   [[ ! -v mirror_index ]] || options+=(--mirror-index "$mirror_index")
   [[ ! -v long_listing ]] || options+=(--long)
   options+=(--proxy inherit)
@@ -2832,6 +3069,7 @@ package_files=()
 until (( $# == 0 ))
 do
   case $1 in
+    --autosuggestions) with_autosuggestions=1 ;;
     --no-user-picked) no_user_picked=1 ;;
     --use-setuprc) warn '--use-setuprc is obsolete; setup.rc is always used' ;;
     --ag) use_ag=1 ;;
@@ -2854,9 +3092,10 @@ do
     --verbose|-v) verbose=1 ;;
     --no-progress) no_progress=1 ;;
     --long) long_listing=1 ;;
-    --benchmark-timeout|--mirror-index|-M|--name|--proxy|-p|--max-jobs|-j|--mirror|-m|--cache|-c|--file|-f)
+    --shell|--benchmark-timeout|--mirror-index|-M|--name|--proxy|-p|--max-jobs|-j|--mirror|-m|--cache|-c|--file|-f)
       (( $# > 1 )) || die "missing value for $1"
       case $1 in
+        --shell) completion_shell=$2 ;;
         --name) pkgname=$2 ;;
         --proxy|-p) proxy_mode=$2 ;;
         --mirror-index|-M) mirror_index=$2 ;;
@@ -2867,6 +3106,10 @@ do
         --file|-f) package_files+=("$2") ;;
       esac
       shift ;;
+    --shell=*) completion_shell=${1#*=} ;;
+    --cache=*) cache_override=${1#*=} ;;
+    --mirror=*) mirror_override=${1#*=} ;;
+    --file=*) package_files+=("${1#*=}") ;;
     --name=*) pkgname=${1#*=} ;;
     --mirror-index=*) mirror_index=${1#*=} ;;
     --benchmark-timeout=*) export APT_CYG_BENCHMARK_TIMEOUT=${1#*=} ;;
@@ -2911,6 +3154,14 @@ done
 if [[ $command == help ]]; then printf '%s' "$usage"; exit 0; fi
 [[ ! -v mirror_index ]] || [[ $mirror_index =~ ^[0-9]+$ ]] || die '--mirror-index requires a nonnegative integer'
 [[ ! $APT_CYG_BENCHMARK_TIMEOUT ]] || [[ $APT_CYG_BENCHMARK_TIMEOUT =~ ^[0-9]+([.][0-9]+)?$ && $APT_CYG_BENCHMARK_TIMEOUT != 0 ]] || die 'invalid benchmark timeout'
+case ${completion_shell:-bash} in bash|zsh|all) ;; *) die '--shell accepts bash, zsh or all' ;; esac
+if [[ -v completion_shell ]]; then
+  case $command in completion|completion-install|completion-uninstall|call|time) ;; *) die '--shell is a completion option' ;; esac
+fi
+if [[ -v with_autosuggestions ]]; then
+  case $command in completion-install|call|time) ;; *) die '--autosuggestions is for completion-install' ;; esac
+  [[ ${completion_shell:-bash} != bash ]] || die '--autosuggestions requires --shell zsh or --shell all'
+fi
 [[ $max_jobs =~ ^[1-9][0-9]?$ ]] && (( max_jobs <= 64 )) || die '--max-jobs must be between 1 and 64'
 [[ ! $pkgname ]] || valid-name "$pkgname" || die 'invalid --name value'
 if [[ -v fix || -v files ]]; then [[ $command == check || $command == call || $command == time ]] || die '--fix and --files are only valid with check'; fi

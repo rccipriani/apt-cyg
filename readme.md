@@ -60,7 +60,7 @@ and can be retried by running `install` for an installed package.
 Reinstall selects the installed archive version from authenticated metadata,
 including a retained previous version. If that version is no longer advertised,
 it fails with instructions to use Setup. Upgrade selects the repository's current
-version when its archive differs from the installed archive; this can select an
+version when its package version differs from the installed version; this can select an
 older version if the repository's current version is older.
 
 Dependencies prefer `depends2`, then `depends`, then legacy `requires`.
@@ -435,6 +435,86 @@ opt-out, run `completion-install --completion-disable-autoupdate`; reinstalling
 completion without the flag reenables refresh. The flag can also skip refresh
 for one self-update. `--completion-get-subcommand` supports completion tooling.
 
+## Cygwin Setup records and completed scripts
+
+Cygwin Setup can record `NAME-VERSION.tar.bz2` in installed.db even when the
+repository archive for the same version uses xz or Zstandard compression. Archive
+names can also include architecture tags. Installed metadata lookup, reinstall,
+and upgrade detection compare the exact package version from signed metadata,
+allowing these representation differences. A same-version compression or tag
+change does not cause a spurious upgrade. A genuinely unavailable installed
+version still produces an error; the checker does not substitute another version.
+
+`check --files` recognizes a completed script at
+`etc/postinstall/SCRIPT.sh.done` (also .dash/.bat/.cmd) when its original name is
+listed in the package manifest. Ordinary files cannot use a .done suffix to
+satisfy a missing-file check. Perpetual `0p_`/`zp_` scripts marked .done are still
+reported for historical repair.
+
+GPG's `Good signature` indicates successful signature verification. The temporary
+verification home has no personal web-of-trust certifications, so `[unknown]` and
+the accompanying trust warning can appear even with the fingerprint-pinned Cygwin
+key. Those messages do not indicate missing package dependency metadata.
+
+## Native Zsh completion and inline suggestions
+
+After updating apt-cyg, install native completion:
+
+```zsh
+apt-cyg completion-install --shell zsh --autosuggestions
+```
+
+This installs `_apt-cyg` in `/usr/local/share/zsh/site-functions` and the optional
+inline-suggestion configuration in
+`/usr/local/share/apt-cyg/zsh-autosuggestions.zsh`. `--shell bash` remains the
+default for compatibility; `--shell all` installs both. `completion --shell zsh`
+prints the native definition, and `completion-uninstall --shell zsh` removes the
+Zsh files while preserving Bash completion. `autosuggestions` prints the optional
+integration script separately.
+
+Native completion covers operations, options, option values, directories/files,
+categories, available packages and installed packages. Options with values can
+precede the operation. Candidate queries read existing metadata or indexes only:
+no downloads, key setup, package scripts, or package-state changes occur while
+completing. If metadata is missing, run `apt-cyg update` explicitly first.
+`completion-candidates available|installed|categories|commands` exposes this
+read-only diagnostic backend.
+
+Inline suggestions use the separately installed
+[zsh-users/zsh-autosuggestions](https://github.com/zsh-users/zsh-autosuggestions)
+plugin. If it is not already installed in Oh My Zsh:
+
+```zsh
+git clone https://github.com/zsh-users/zsh-autosuggestions \
+  "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"
+```
+
+In .zshrc, after your existing plugins assignment and before the existing
+`source "$ZSH/oh-my-zsh.sh"` line, add:
+
+```zsh
+fpath=(/usr/local/share/zsh/site-functions $fpath)
+plugins+=(zsh-autosuggestions)
+```
+
+After the Oh My Zsh source line, add:
+
+```zsh
+source /usr/local/share/apt-cyg/zsh-autosuggestions.zsh
+```
+
+Restart Zsh. Tab invokes native completion; zsh-autosuggestions displays an inline
+suggestion that can be accepted with Right Arrow. The integration retains existing
+history/custom strategies and adds an apt-cyg-specific completion strategy. It is
+safe to source repeatedly. Unrelated commands keep their existing suggestion
+behavior. Without Oh My Zsh, initialize `compinit` after adding the completion
+directory to fpath, load zsh-autosuggestions, then source the integration file.
+
+Self-update refreshes any installed Bash definition, Zsh definition and inline
+integration from the new script, syntax-checking each and retaining .bak copies.
+The existing persistent/per-update completion opt-out applies to all managed
+shell integration files.
+
 ## Operational limits
 
 Mutating commands take an atomic directory lock at `/etc/setup/.apt-cyg.lock`;
@@ -458,7 +538,7 @@ shellcheck -S error apt-cyg
 python3 -m unittest discover -s tests -v
 ```
 
-Tests require Python 3, Bash, GPG, and the listed GNU tools. They generate a
+Tests require Python 3 with pexpect, Bash, Zsh, GPG, and the listed GNU tools. They generate a
 fixture signing key and operate on isolated alternate roots with local package
 archives. They cover dependency repair, plans, tracking, upgrade/reinstall,
 removal, locking, signature checks, compression fallback, cached indexing,
