@@ -112,7 +112,7 @@ apt-cyg key-list
 A missing/invalid signature fails closed. Metadata timestamps are checked against
 the previous cache to reject rollback when a prior timestamp is available.
 `--no-verify` is an explicit signature-verification bypass. Package archives are
-checked using the MD5, SHA-256, or SHA-512 digest recorded in metadata; Cygwin
+checked using the MD5, SHA-1, SHA-224, SHA-256, SHA-384, or SHA-512 digest recorded in metadata; Cygwin
 repository signatures authenticate the metadata containing those hashes. This
 does not claim separate detached signatures exist for every package archive.
 
@@ -311,6 +311,129 @@ features documented by [apt-cyg2](https://github.com/zensage/apt-cyg2) and
 [kou1okada/apt-cyg](https://github.com/kou1okada/apt-cyg). The latter's destructive
 process termination, write-open lock probes, and simplistic WPAD discovery are
 not used.
+
+## Remaining fork tools and compatibility
+
+The full [fork compatibility inventory](docs/fork-compatibility.md) lists every
+operation group, option, adaptation, and deliberate exclusion from the two
+feature-rich forks reviewed for this project.
+
+### Historical script and targeted permission repair
+
+```bash
+apt-cyg repair-postinstall --simulate
+apt-cyg repair-postinstall --yes
+apt-cyg check --fix --simulate
+apt-cyg repair-acl /usr/local/bin/apt-cyg --simulate
+```
+
+`repair-postinstall` restores `0p_`/`zp_` scripts historically renamed `.done` by
+older installers. If both copies exist, the newer copy is retained; the completed
+copy and any overwritten active copy are backed up under
+`/etc/setup/postinstall-backups`. Restoration alone does not execute scripts.
+`check --fix` also performs the restoration and runs restored perpetual scripts
+unless `--noscripts` is set. A read-only check detects these historical mistakes.
+
+`repair-acl` requires explicit file/directory paths and `getfacl`. It saves every
+target's ACL and path under `/etc/setup/acl-backups` before changing any target,
+then grants only owner read/write access and owner directory traversal. It does
+not recurse, follow a final symbolic link, reset inheritance, remove SIDs, or
+replace group/other permissions. Complex Windows ACL damage still needs native
+permission tools; use the saved ACL records if restoration is needed.
+
+### File caches and dependency reports
+
+```bash
+apt-cyg packageof 'bin/.*vim' -i
+apt-cyg packageof 'jq' --force-update-packageof-cache
+apt-cyg filelist jq
+apt-cyg filesearch 'cygjq.*dll'
+apt-cyg filesearch 'cygjq.*dll' --refresh
+apt-cyg list-desired-packages
+apt-cyg list-required-packages
+apt-cyg list-orphaned-packages
+apt-cyg list-lacked-packages
+apt-cyg list-overages-and-shortages-of-packages --no-header
+apt-cyg list-required-packages -- +vim -nano
+```
+
+`packageof` stores an installed-file index in `/etc/setup/apt-cyg-owners.idx`.
+SHA-256 fingerprints of the database and compressed manifests invalidate it on
+additions, removals, or manifest content changes. `--ag` selects an optional
+`the_silver_searcher` backend. Our existing `search` remains an exact ownership
+lookup; `packageof` searches patterns across package/path rows.
+
+`filelist` obtains the repository-current package's file listing from cygwin.com
+without downloading its binary archive. `filesearch` caches the online package
+query and returns matching current-version file paths. These website responses
+are diagnostics, not authenticated installation manifests. The cache lives at
+`CACHE/apt-cyg-web/ARCH`; its default lifetime is 86400 seconds, controlled by
+`APT_CYG_WEB_CACHE_TTL`. `--refresh` bypasses that cache; `--noupdate` requires
+cached metadata/pages and permits expired web pages for offline diagnostics.
+TTL age starts at fetch time, independently of server Last-Modified timestamps.
+
+Dependency reports do not change installed packages or marks. Desired roots are
+manual picks, Base packages, protected essentials, and installed packages absent
+from the repository. Required packages include those roots and their dependency
+closure. `+PKG`/`-PKG` change hypothetical roots only. Missing installed-version
+records or unresolved alternatives make dependency reports fail instead of
+printing a guessed closure. Reports check package presence, not version-constraint
+satisfaction. `list-installed-packages` aliases `list`.
+
+### Browsing, configuration, and compatibility options
+
+```bash
+apt-cyg browse-summary jq
+apt-cyg browse-homepage jq --simulate
+apt-cyg browse-homepage-with-mirror-source jq --simulate
+apt-cyg setuprc-get last-mirror
+apt-cyg set-mirror URL1 URL2
+apt-cyg update --mirror-index 1
+apt-cyg get-proxy
+apt-cyg ls-pkg-with-category
+apt-cyg call list
+apt-cyg time check
+```
+
+Browser commands require `cygstart` from `cygutils`; simulation prints the URL.
+Homepage lookup can use the source-package summary or a verified source archive.
+Cygport/patch files are read as text, never sourced or evaluated. Only literal
+HTTP(S) URLs are opened. `set-cache`, `mark-showauto`, `mark-showmanual`, and `help`
+are additional compatibility aliases. `get-proxy` prints shell-quoted effective
+proxy exports and may expose credentials only when explicitly requested.
+`APT_CYG_PROXY` supplies the default explicit proxy policy.
+
+`--no-user-picked` makes explicit install/localinstall targets automatic instead
+of manual. `--force-fetch-trustedkeys` explicitly refreshes the fingerprint-pinned
+Cygwin key while retaining custom keys. `--use-setuprc` is an accepted obsolete
+no-op; setup.rc is always consulted. `--no-verify` also accepts `-X`.
+
+`call` and `time` accept public operation names, including `apt-cyg-OPERATION`
+compatibility names. They invoke a child CLI with normal validation, locking,
+simulation and trust options. Arbitrary internal helpers and shell evaluation
+are not exposed.
+
+### Download and completion improvements
+
+Metadata requests use ETag/Last-Modified validators with wget/curl. HTTP 304 is
+accepted only with a previously signature-verified source, and the detached
+signature is verified again before use. Changed or corrupt metadata still fails
+closed. `--ipv4` (`-4`) selects IPv4; `--benchmark-timeout` controls benchmark
+request timeouts. SHA-1, SHA-224 and SHA-384 archive digests are now supported in
+addition to MD5, SHA-256 and SHA-512. Signature policy is unchanged.
+
+`--no-check-certificate` explicitly disables wget/curl TLS certificate checking;
+signatures/checksums still apply. Self-update refuses this option because its
+trust depends on HTTPS. IPv4 and TLS-bypass flags require wget or curl, not lynx.
+`--no-update-setup` requires an existing cached installer and still verifies it.
+`packages-total-size REGEXP` selects metadata version sections for size totals;
+without a pattern, it retains the current-version total.
+
+Self-update now regenerates installed Bash completion using the new script,
+syntax-checks it, and saves the previous completion as `.bak`. To persist an
+opt-out, run `completion-install --completion-disable-autoupdate`; reinstalling
+completion without the flag reenables refresh. The flag can also skip refresh
+for one self-update. `--completion-get-subcommand` supports completion tooling.
 
 ## Operational limits
 
