@@ -222,14 +222,15 @@ SELF_UPDATE_URL=https://raw.githubusercontent.com/rccipriani/apt-cyg/master/apt-
 CYGWIN_FINGERPRINT=56405CF6FCC81574682A5D561A698DE9E2E56300
 
 
-declare -A IDX_FILE IDX_HASH IDX_VER IDX_DEPS IDX_CAT IDX_REL IDX_SIZE IDX_SOURCE IDX_SOURCE_SIZE IDX_SOURCE_HASH
-declare -A INST_DEPS INST_KNOWN
+declare -A IDX_FILE IDX_HASH IDX_VER IDX_DEPS IDX_CAT IDX_REL IDX_SIZE IDX_SOURCE IDX_SOURCE_SIZE IDX_SOURCE_HASH IDX_PROVIDES
+declare -A INST_DEPS INST_KNOWN INST_PROVIDES INST_REL INST_PROVIDERS_KNOWN
 declare -A INST_FILE INST_FLAG
 declare -A PLAN_SEEN PLAN_ACT PLAN_FLAG PLAN_ARCHIVE UPG_SET REINST_SET
 PLAN=()
+REQUESTED_PACKAGES=()
 pks=()
 DB_HEADER='INSTALLED.DB 3'
-IDX_MAGIC='#apt-cyg-index|3'
+IDX_MAGIC='#apt-cyg-index|4'
 
 # ---------------------------------------------------------------------------
 # messages, cleanup and locking
@@ -675,6 +676,7 @@ function deplist(s,    n, i, a, out) {
 function reset_version() {
   file = size = hash = ver = req = relation = srfile = srsize = srhash = ""
   modern_seen = 0
+  provided = obsolete = ""; provides_seen = 0
 }
 function installed_version_matches(    stem, expected) {
   if (ENVIRON["wanted_version_match"] != "1" || ver == "") return 0
@@ -684,7 +686,7 @@ function installed_version_matches(    stem, expected) {
   expected = name "-" ver
   return stem == expected || stem == expected "-" ENVIRON["wanted_arch"] || stem == expected "-noarch"
 }
-function version_flush(    filename, dependencies, raw) {
+function version_flush(    filename, dependencies, raw, aliases, provider_raw) {
   if (file == "") return
   filename = file
   sub(/^.*\//, "", filename)
@@ -694,14 +696,18 @@ function version_flush(    filename, dependencies, raw) {
     raw = modern_seen ? relation : (req != "" ? req : base_requires)
     dependencies = deplist(raw)
     gsub(/\|/, "%7C", raw)
-    chosen = name OFS file OFS size OFS hash OFS ver OFS dependencies OFS cats OFS raw OFS srfile OFS srsize OFS srhash
+    provider_raw = provides_seen ? provided : obsolete
+    # Setup uses obsoletes as provides only when provides is absent.
+    # Qualified relationships need the official solver; do not invent capabilities.
+    aliases = provider_raw ~ /[()|]/ ? "" : deplist(provider_raw)
+    chosen = name OFS file OFS size OFS hash OFS ver OFS dependencies OFS cats OFS raw OFS srfile OFS srsize OFS srhash OFS aliases
   }
 }
 function flush() {
   version_flush()
   if (chosen != "") print chosen
 }
-BEGIN { OFS = "|"; print "#apt-cyg-index", "3" }
+BEGIN { OFS = "|"; print "#apt-cyg-index", "4" }
 inq {
   if (gsub(/"/, "&") % 2) inq = 0
   next
@@ -726,6 +732,8 @@ name == "" { next }
 $1 == "version:" { version_seen = 1; ver = $2 }
 $1 == "install:" { file = $2; size = $3; hash = $4 }
 $1 == "source:" { srfile = $2; srsize = $3; srhash = $4 }
+$1 == "provides:" { provided=substr($0,index($0,":")+1); provides_seen=1 }
+$1 == "obsoletes:" { obsolete=substr($0,index($0,":")+1) }
 $1 == "requires:" {
   if (!version_seen) base_requires = substr($0, 10)
   else req = substr($0, 10)
@@ -740,16 +748,17 @@ END { flush() }
 '
 
 function select-installed-version {
-  local p=$1 record n f size h v d c relation sf ss sh
+  local p=$1 record n f size h v d c relation sf ss sh aliases
   record=$(wanted_package="$p" wanted_archive="${INST_FILE[$p]}" wanted_version_match=1 wanted_arch="$arch" gawk "$IDX_AWK" "$archdir/setup.ini" | tail -n +2)
   [[ $record ]] || { warn "authenticated metadata for installed version of $p is unavailable; use Cygwin Setup"; return 1; }
-  IFS='|' read -r n f size h v d c relation sf ss sh <<< "$record"
+  IFS='|' read -r n f size h v d c relation sf ss sh aliases <<< "$record"
   IDX_FILE[$p]=$f
   IDX_HASH[$p]=$h
   IDX_VER[$p]=$v
   IDX_DEPS[$p]=$d
   IDX_CAT[$p]=$c
   IDX_REL[$p]=${relation//%7C/|}
+  IDX_PROVIDES[$p]=$aliases
 }
 
 function build-index {
@@ -767,9 +776,9 @@ function build-index {
 function load-index {
   [[ $INDEX_LOADED ]] && return 0
   build-index || die 'cannot build the package index'
-  local n f s h v d c relation sf ss sh
+  local n f s h v d c relation sf ss sh aliases
   # '|' rather than tab: a non-blank IFS keeps empty fields in place
-  while IFS='|' read -r n f s h v d c relation sf ss sh
+  while IFS='|' read -r n f s h v d c relation sf ss sh aliases
   do
     [[ $n == '#'* ]] && continue
     IDX_FILE[$n]=$f
@@ -780,6 +789,7 @@ function load-index {
     IDX_REL[$n]=${relation//%7C/|}
     IDX_SIZE[$n]=$s
     IDX_SOURCE[$n]=$sf IDX_SOURCE_SIZE[$n]=$ss IDX_SOURCE_HASH[$n]=$sh
+    IDX_PROVIDES[$n]=$aliases
   done < "$archdir/setup.idx"
   INDEX_LOADED=1
   [[ ! $DB_LOADED ]] || load-installed-dependencies
@@ -843,28 +853,76 @@ function save-db {
 
 
 function load-installed-dependencies {
-  local p deps recorded
+  local p record recorded n f size hash version deps cats relation sf ss sh aliases
   for p in "${!INST_FILE[@]}"
   do
+    unset 'INST_DEPS[$p]' 'INST_KNOWN[$p]' 'INST_PROVIDES[$p]' 'INST_REL[$p]' 'INST_PROVIDERS_KNOWN[$p]'
+    if installed-is-current "$p"
+    then
+      INST_DEPS[$p]=${IDX_DEPS[$p]} INST_REL[$p]=${IDX_REL[$p]}
+      INST_PROVIDES[$p]=${IDX_PROVIDES[$p]} INST_KNOWN[$p]=1 INST_PROVIDERS_KNOWN[$p]=1
+      continue
+    fi
+    record=
+    if [[ $INDEX_LOADED ]]
+    then
+      record=$(wanted_package="$p" wanted_archive="${INST_FILE[$p]}" wanted_version_match=1 wanted_arch="$arch" gawk "$IDX_AWK" "$archdir/setup.ini" | tail -n +2) || return 1
+    fi
+    if [[ $record ]]
+    then
+      IFS='|' read -r n f size hash version deps cats relation sf ss sh aliases <<< "$record"
+      INST_DEPS[$p]=$deps INST_REL[$p]=${relation//%7C/|} INST_PROVIDES[$p]=$aliases
+      INST_KNOWN[$p]=1 INST_PROVIDERS_KNOWN[$p]=1
+      continue
+    fi
     if [[ -f $SETUP/$p.deps ]] && read -r recorded < "$SETUP/$p.deps" && [[ $recorded == "${INST_FILE[$p]}" ]]
     then
       INST_DEPS[$p]=$(tail -n +2 -- "$SETUP/$p.deps")
       INST_KNOWN[$p]=1
-    elif installed-is-current "$p"
+    fi
+    if [[ -f $SETUP/$p.provides ]] && read -r recorded < "$SETUP/$p.provides" && [[ $recorded == "${INST_FILE[$p]}" ]]
     then
-      INST_DEPS[$p]=${IDX_DEPS[$p]}
-      INST_KNOWN[$p]=1
-    elif [[ $INDEX_LOADED ]]
-    then
-      deps=$(wanted_package="$p" wanted_archive="${INST_FILE[$p]}" wanted_version_match=1 wanted_arch="$arch" gawk "$IDX_AWK" "$archdir/setup.ini" | tail -n +2)
-      if [[ $deps ]]
-      then
-        IFS="|" read -r _ _ _ _ _ deps _ <<< "$deps"
-        INST_DEPS[$p]=$deps
-        INST_KNOWN[$p]=1
-      fi
+      INST_PROVIDES[$p]=$(tail -n +2 -- "$SETUP/$p.provides")
+      INST_PROVIDERS_KNOWN[$p]=1
     fi
   done
+}
+
+function windows-present {
+  if [[ ! -v WINDOWS_PRESENT ]]
+  then
+    WINDOWS_PRESENT=0
+    if [[ $ROOT && ${APT_CYG_WINDOWS_VERSION:-} =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || [[ $(uname -s) == CYGWIN_NT-* ]]
+    then WINDOWS_PRESENT=1; fi
+  fi
+  [[ $WINDOWS_PRESENT == 1 ]]
+}
+
+function dependency-provider {
+  # Resolve installed or explicitly requested/planned providers, never guess a new one.
+  local dependency=$1 excluded=${2:-} state=${3:-planned} provider aliases
+  PROVIDER_REPLY=
+  if [[ $dependency == _windows ]] && windows-present
+  then PROVIDER_REPLY=_windows; return 0; fi
+  if is-installed "$dependency" && ! in-list "$dependency" "$excluded"
+  then PROVIDER_REPLY=$dependency; return 0; fi
+  while IFS= read -r provider
+  do
+    in-list "$provider" "$excluded" && continue
+    aliases=${INST_PROVIDES[$provider]}
+    # Upgrades must use the selected version's capabilities, not stale ones.
+    if [[ $state != current && ( ${UPG_SET[$provider]} || ${REINST_SET[$provider]} ) ]]; then aliases=${IDX_PROVIDES[$provider]}; fi
+    if in-list "$dependency" "$aliases"
+    then PROVIDER_REPLY=$provider; return 0; fi
+  done < <(sorted-installed)
+  [[ $state != current ]] || return 1
+  for provider in "${PLAN[@]}" "${REQUESTED_PACKAGES[@]}"
+  do
+    in-list "$provider" "$excluded" && continue
+    if in-list "$dependency" "${IDX_PROVIDES[$provider]}"
+    then PROVIDER_REPLY=$provider; return 0; fi
+  done
+  return 1
 }
 
 function validate-dependencies {
@@ -1097,8 +1155,10 @@ function install-archive {
   save-db || return 1
   printf '%s\n%s\n' "${INST_FILE[$p]}" "${IDX_DEPS[$p]}" > "$SETUP/$p.deps.tmp.$$" || return 1
   mv -f -- "$SETUP/$p.deps.tmp.$$" "$SETUP/$p.deps" || return 1
-  INST_DEPS[$p]=${IDX_DEPS[$p]}
-  INST_KNOWN[$p]=1
+  printf '%s\n%s\n' "${INST_FILE[$p]}" "${IDX_PROVIDES[$p]}" > "$SETUP/$p.provides.tmp.$$" || return 1
+  mv -f -- "$SETUP/$p.provides.tmp.$$" "$SETUP/$p.provides" || return 1
+  INST_DEPS[$p]=${IDX_DEPS[$p]} INST_REL[$p]=${IDX_REL[$p]} INST_PROVIDES[$p]=${IDX_PROVIDES[$p]}
+  INST_KNOWN[$p]=1 INST_PROVIDERS_KNOWN[$p]=1
   return $rc
 }
 
@@ -1115,8 +1175,8 @@ function remove-package {
     return 1
   fi
   rm -f -- "$man" "$POSTINSTALL/$p".{sh,dash,bat,cmd}.done
-  rm -f -- "$SETUP/$p.deps"
-  unset 'INST_FILE[$p]' 'INST_FLAG[$p]'
+  rm -f -- "$SETUP/$p.deps" "$SETUP/$p.provides"
+  unset 'INST_FILE[$p]' 'INST_FLAG[$p]' 'INST_DEPS[$p]' 'INST_PROVIDES[$p]' 'INST_REL[$p]' 'INST_KNOWN[$p]' 'INST_PROVIDERS_KNOWN[$p]'
   save-db || return 1
   log-action "remove $p"
   echo "Package $p removed"
@@ -1149,6 +1209,12 @@ function fetch-package {
 
 function plan-visit {
   local p=$1 d deps
+  if [[ $p == _windows ]] && windows-present; then return 0; fi
+  if ! is-installed "$p" && dependency-provider "$p"
+  then
+    [[ $PROVIDER_REPLY == _windows ]] && return 0
+    if [[ $PROVIDER_REPLY != "$p" ]]; then plan-visit "$PROVIDER_REPLY"; return $?; fi
+  fi
   [[ ${PLAN_SEEN[$p]} ]] && return 0
   PLAN_SEEN[$p]=1
   if ! in-index "$p"
@@ -1257,6 +1323,7 @@ function execute-plan {
 
 function run-plan {
   # Shared execution for install, upgrade, and reinstall.
+  if [[ ! -v nodeps ]] && (( ${#PLAN[@]} )); then validate-planned-providers || return 1; fi
   if (( ! ${#PLAN[@]} ))
   then
     [[ -v simulate ]] && { echo 'No package changes planned.'; return 0; }
@@ -1271,6 +1338,40 @@ function run-plan {
   fi
   confirm || { echo Aborted.; return 1; }
   execute-plan
+}
+
+function validate-planned-providers {
+  local package dependency previous capability_change=
+  for package in "${!UPG_SET[@]}" "${!REINST_SET[@]}"
+  do
+    [[ ${INST_PROVIDERS_KNOWN[$package]} ]] || { warn "installed provider metadata unavailable for $package; use Cygwin Setup"; return 1; }
+    [[ ${INST_PROVIDES[$package]} == "${IDX_PROVIDES[$package]}" ]] || capability_change=1
+  done
+  for package in "${!INST_FILE[@]}"
+  do
+    [[ ! ${UPG_SET[$package]} && ! ${REINST_SET[$package]} ]] || continue
+    if [[ ! ${INST_KNOWN[$package]} ]]
+    then
+      [[ ! $capability_change ]] && continue
+      warn "dependency metadata unavailable for $package while providers change; use Cygwin Setup"
+      return 1
+    fi
+    for dependency in ${INST_DEPS[$package]}
+    do
+      dependency-provider "$dependency" '' current || continue
+      previous=$PROVIDER_REPLY
+      if ! dependency-provider "$dependency"
+      then
+        warn "planned changes would break $package: dependency $dependency loses its provider; use Cygwin Setup"
+        return 1
+      fi
+      if [[ $previous != "$PROVIDER_REPLY" && $dependency != _windows && ${INST_REL[$package]} == *['()|']* ]]
+      then
+        warn "constraint-aware provider replacement for $package requires Cygwin Setup"
+        return 1
+      fi
+    done
+  done
 }
 
 function guard-running-cygwin {
@@ -1298,6 +1399,18 @@ function apt-install {
   load-index
   load-db
   local p
+  local -a requested=()
+  for p in "${pks[@]}"
+  do
+    if ! is-installed "$p" && dependency-provider "$p"
+    then
+      [[ $PROVIDER_REPLY != _windows ]] || { warn '_windows is an OS capability, not an installable package'; return 1; }
+      p=$PROVIDER_REPLY
+    fi
+    requested+=("$p")
+  done
+  pks=("${requested[@]}")
+  REQUESTED_PACKAGES=("${requested[@]}")
   for p in "${pks[@]}"
   do
     if ! in-index "$p" && ! is-installed "$p"
@@ -1389,7 +1502,7 @@ function apt-remove {
   find-workspace
   load-index
   load-db
-  local p q d idx=1 bad=0 targets=() dependents
+  local p q d bad=0 targets=()
   for p in "${pks[@]}"
   do
     if ! is-installed "$p"
@@ -1405,41 +1518,32 @@ function apt-remove {
     fi
     targets+=("$p")
   done
-  for q in "${!INST_FILE[@]}"
-  do
-    if [[ ! ${INST_KNOWN[$q]} && ! -v force ]]
-    then
-      warn "installed dependency metadata unavailable for $q; use Cygwin Setup"
-      return 1
-    fi
-  done
-  # refuse to break installed packages that still depend on a target
-  if (( idx ))
+  if [[ ! -v force ]]
   then
-    for p in "${targets[@]}"
+    for q in "${!INST_FILE[@]}"
     do
-      dependents=
-      while read -r q
+      [[ ${INST_PROVIDERS_KNOWN[$q]} ]] || { warn "installed provider metadata unavailable for $q; use Cygwin Setup"; return 1; }
+    done
+    for q in "${!INST_FILE[@]}"
+    do
+      in-list "$q" "${targets[*]}" && continue
+      [[ ${INST_KNOWN[$q]} && ${INST_PROVIDERS_KNOWN[$q]} ]] || { warn "installed dependency/provider metadata unavailable for $q; use Cygwin Setup"; return 1; }
+      for d in ${INST_DEPS[$q]}
       do
-        in-list "$q" "${targets[*]}" && continue
-        for d in ${INST_DEPS[$q]}
-        do
-          [[ $d == "$p" ]] && dependents+=" $q"
-        done
-      done < <(sorted-installed)
-      if [[ $dependents ]]
-      then
-        if [[ -v force ]]
+        # Do not turn an unrelated preexisting missing dependency into a removal block.
+        dependency-provider "$d" || continue
+        local previous_provider=$PROVIDER_REPLY
+        if ! dependency-provider "$d" "${targets[*]}"
         then
-          warn "removing $p anyway (--force), needed by:$dependents"
-        else
-          warn "cannot remove $p, needed by:$dependents (use --force)"
+          warn "cannot remove ${targets[*]}, needed by $q (dependency $d)"
+          bad=1
+        elif in-list "$previous_provider" "${targets[*]}" && [[ $d != _windows && $PROVIDER_REPLY != "$previous_provider" && ${INST_REL[$q]} == *['()|']* ]]
+        then
+          warn "provider replacement for constrained dependencies of $q requires Cygwin Setup"
           bad=1
         fi
-      fi
+      done
     done
-  else
-    warn 'no setup.ini available, reverse dependencies not checked'
   fi
   (( bad )) && return 1
   (( ${#targets[@]} )) || return 0
@@ -1475,7 +1579,7 @@ function apt-autoremove {
   done
   for p in "${!INST_FILE[@]}"
   do
-    [[ ${INST_KNOWN[$p]} ]] || { warn "installed dependency metadata unavailable for $p; refusing autoremove"; return 1; }
+    [[ ${INST_KNOWN[$p]} && ${INST_PROVIDERS_KNOWN[$p]} ]] || { warn "installed dependency/provider metadata unavailable for $p; refusing autoremove"; return 1; }
   done
   # mark everything reachable through dependencies
   while (( ${#stack[@]} ))
@@ -1486,7 +1590,13 @@ function apt-autoremove {
     keep[$p]=1
     for d in ${INST_DEPS[$p]}
     do
-      is-installed "$d" && [[ ! ${keep[$d]} ]] && stack+=("$d")
+      if dependency-provider "$d"
+      then
+        [[ $PROVIDER_REPLY != _windows ]] || continue
+        if [[ $PROVIDER_REPLY != "$d" && ${INST_REL[$p]} == *['()|']* ]]
+        then warn "constraint-aware provider retention for $p requires Cygwin Setup"; return 1; fi
+        [[ ${keep[$PROVIDER_REPLY]} ]] || stack+=("$PROVIDER_REPLY")
+      fi
     done
   done
   while read -r p
@@ -1947,12 +2057,15 @@ function apt-completion-candidates {
   local kind=${pks[0]:-available} index
   case $kind in
     commands) printf '%s\n' $COMMANDS; return 0 ;;
+    options)
+      printf '%s\n' --shell --autosuggestions --simulate --dry-run --yes --nodeps --noscripts --no-verify --force --no-user-picked --ag --refresh --ipv4 --noupdate --no-header --no-check-certificate --no-update-setup --force-remove --force-fetch-trustedkeys --force-update-packageof-cache --completion-disable-autoupdate --completion-get-subcommand --mirror-index --benchmark-timeout --files --fix --allow-untrusted --ignore-case --quiet --verbose --no-progress --long --proxy --file --name --max-jobs --mirror --cache --help --version
+      return 0 ;;
     installed)
       [[ -f $DB ]] || return 0
       gawk 'NR > 1 && $1 ~ /^[A-Za-z0-9_+.-]+$/ && $1 != "." && $1 != ".." { print $1 }' "$DB" | LC_ALL=C sort -u
       return $? ;;
     available|categories) ;;
-    *) die 'candidate kind must be commands, installed, available or categories' ;;
+    *) die 'candidate kind must be commands, options, installed, available or categories' ;;
   esac
   completion_readonly=1 no_auto_setup=1 find-workspace soft >/dev/null 2>&1 || return 0
   index=$archdir/setup.idx
@@ -2017,7 +2130,7 @@ _apt_cyg_complete() {
     install|download|source|mirror-source|show|depends|rdepends|listall|find|describe|filelist|browse-*) kind=available ;;
     category) kind=categories ;;
     localinstall|key-add|repair-acl) mapfile -t COMPREPLY < <(compgen -f -- "$word"); return 0 ;;
-    completion-candidates) mapfile -t COMPREPLY < <(compgen -W 'available installed categories commands' -- "$word"); return 0 ;;
+    completion-candidates) mapfile -t COMPREPLY < <(compgen -W 'available installed categories commands options' -- "$word"); return 0 ;;
     pathof) mapfile -t COMPREPLY < <(compgen -W 'root cache mirror mirrors mirrordir setup.ini database keyring setup' -- "$word"); return 0 ;;
     *) return 0 ;;
   esac
@@ -2078,7 +2191,7 @@ case $operation in
   category) kind=categories ;;
   localinstall|key-add|repair-acl) _files; return ;;
   call|time) _describe 'apt-cyg operation' operations; return ;;
-  completion-candidates) candidates=(available installed categories commands); compadd -a candidates; return ;;
+  completion-candidates) candidates=(available installed categories commands options); compadd -a candidates; return ;;
   pathof) candidates=(root cache mirror mirrors mirrordir setup.ini database keyring setup); compadd -a candidates; return ;;
   *) return 0 ;;
 esac
@@ -2092,14 +2205,66 @@ ZSH_COMPLETION
 
 function apt-autosuggestions {
   cat <<'ZSH_AUTOSUGGESTIONS'
-# Source from .zshrc alongside zsh-users/zsh-autosuggestions and native apt-cyg completion.
-# This adds completion-based suggestions for apt-cyg only; existing strategies are retained.
+# Source from .zshrc alongside zsh-users/zsh-autosuggestions.
+# Cached apt-cyg suggestions without zpty, ZLE completion capture, or shell evaluation.
 _zsh_autosuggest_strategy_apt_cyg() {
   emulate -L zsh
-  local first=${1%%[[:space:]]*}
+  local prefix=$1 first partial operation= expect= end_options= kind= item candidate output i
+  local -a tokens query=() candidates=()
+  # History handles quoted/escaped input; this provider never evaluates shell text.
+  [[ $prefix != *[\"\'\`\$\\]* && $prefix != *$'\n'* ]] || return 1
+  tokens=(${=prefix})
+  (( ${#tokens} )) || return 1
+  first=$tokens[1]
   [[ ${first:t} == apt-cyg ]] || return 1
-  (( $+functions[_zsh_autosuggest_strategy_completion] )) || return 1
-  _zsh_autosuggest_strategy_completion "$1"
+  if [[ $prefix == *[[:space:]] ]]; then partial=; tokens+=('')
+  else partial=$tokens[-1]; fi
+  for (( i=2; i<${#tokens}; i++ ))
+  do
+    item=$tokens[i]
+    if [[ -n $expect ]]
+    then
+      case $expect in --cache|-c) query+=(--cache "$item") ;; --mirror|-m) query+=(--mirror "$item") ;; --mirror-index|-M) query+=(--mirror-index "$item") ;; esac
+      expect=; continue
+    fi
+    if [[ -z $end_options ]]
+    then
+      case $item in
+        --) end_options=1; continue ;;
+        --cache|-c|--mirror|-m|--mirror-index|-M|--proxy|-p|--file|-f|--name|--max-jobs|-j|--benchmark-timeout|--shell) expect=$item; continue ;;
+        --cache=*|--mirror=*|--mirror-index=*) query+=("$item"); continue ;;
+        -*) continue ;;
+      esac
+    fi
+    [[ -n $operation ]] || operation=$item
+  done
+  if [[ -n $expect ]]
+  then
+    case $expect in --shell) candidates=(bash zsh all) ;; --proxy|-p) candidates=(inherit none) ;; *) return 1 ;; esac
+  elif [[ $partial == -* && -z $end_options ]]
+  then kind=options
+  elif [[ -z $operation ]]
+  then kind=commands
+  else
+    case $operation in
+      remove|reinstall|upgrade|mark-auto|mark-manual|busy|show-packages-busyness|check|list) kind=installed ;;
+      install|download|source|mirror-source|show|depends|rdepends|listall|find|describe|filelist|browse-*) kind=available ;;
+      category) kind=categories ;;
+      *) return 1 ;;
+    esac
+  fi
+  if [[ -n $kind ]]
+  then
+    output=$(command "$first" "${query[@]}" completion-candidates "$kind" 2>/dev/null) || return 1
+    candidates=("${(@f)output}")
+  fi
+  for candidate in "${candidates[@]}"
+  do
+    [[ -n $candidate && $candidate == "$partial"* && $candidate != "$partial" ]] || continue
+    typeset -g suggestion="${prefix}${candidate#"$partial"}"
+    return 0
+  done
+  return 1
 }
 if (( ! ${+ZSH_AUTOSUGGEST_STRATEGY} )); then
   typeset -ga ZSH_AUTOSUGGEST_STRATEGY=(history)
@@ -2231,7 +2396,7 @@ function check-scan {
     fi
     for d in ${INST_DEPS[$p]}
     do
-      if ! is-installed "$d"
+      if ! dependency-provider "$d"
       then
         warn "$p: missing dependency $d"
         CHECK_MISSING+=("$d")
@@ -2302,7 +2467,7 @@ function apt-localinstall {
   find-workspace
   load-index
   load-db
-  local input archive base stem name record n f sz hash ver deps cats relation sf ss sh hint raw
+  local input archive base stem name record n f sz hash ver deps cats relation sf ss sh aliases hint raw
   local -a names=()
   declare -A local_seen
   for input in "${pks[@]}"
@@ -2330,7 +2495,7 @@ function apt-localinstall {
     record=$(wanted_package="$name" wanted_archive="$base" gawk "$IDX_AWK" "$archdir/setup.ini" | tail -n +2)
     if [[ $record ]]
     then
-      IFS='|' read -r n f sz hash ver deps cats relation sf ss sh <<< "$record"
+      IFS='|' read -r n f sz hash ver deps cats relation sf ss sh aliases <<< "$record"
       verify-hash "$archive" "$hash" || { warn "local archive does not match authenticated metadata: $base"; return 1; }
     else
       [[ -v allow_untrusted ]] || { warn "$base is not in authenticated metadata; use --allow-untrusted only for a trusted local package"; return 1; }
@@ -2344,10 +2509,11 @@ function apt-localinstall {
       ' "$hint") || { warn 'hint must explicitly declare dependencies, even an empty list'; return 1; }
       [[ $raw != *'|'* && $raw != *'('* && $raw != *')'* ]] || { warn 'version constraints and alternatives require Cygwin Setup'; return 1; }
       relation=$raw
+      aliases=
       deps=${raw//,/ }
       warn "explicitly trusting local archive: $base"
     fi
-    IDX_FILE[$name]=$base IDX_DEPS[$name]=$deps IDX_REL[$name]=${relation//%7C/|}
+    IDX_FILE[$name]=$base IDX_DEPS[$name]=$deps IDX_REL[$name]=${relation//%7C/|} IDX_PROVIDES[$name]=$aliases
     validate-dependencies "$name" || return 1
     # Keep the original basename: installed.db must never record our temporary prefix.
     mkdir -p -- "$TMPD/local-${#names[@]}" || return 1
@@ -2357,6 +2523,7 @@ function apt-localinstall {
     is-installed "$name" && UPG_SET[$name]=1
     names+=("$name")
   done
+  REQUESTED_PACKAGES=("${names[@]}")
   for name in "${names[@]}"; do plan-visit "$name" || return 1; done
   run-plan || return 1
   if [[ ! -v simulate ]]
@@ -2853,6 +3020,8 @@ function calculate-package-report {
   do
     p=${change#[+-]}
     valid-name "$p" || die "invalid package difference: $change"
+    if ! is-installed "$p" && dependency-provider "$p"; then p=$PROVIDER_REPLY; fi
+    [[ $p != _windows ]] || continue
     in-index "$p" || is-installed "$p" || { warn "unknown package: $p"; return 1; }
     if [[ $change == -* ]]; then unset 'REPORT_DESIRED[$p]'
     else REPORT_DESIRED[$p]=1; fi
@@ -2862,6 +3031,8 @@ function calculate-package-report {
   while (( ${#stack[@]} ))
   do
     p=${stack[-1]}; unset 'stack[-1]'
+    if dependency-provider "$p"; then p=$PROVIDER_REPLY; fi
+    [[ $p != _windows ]] || { windows-present && continue; }
     [[ ! ${REPORT_REQUIRED[$p]} ]] || continue
     REPORT_REQUIRED[$p]=1
     if is-installed "$p"
@@ -2882,7 +3053,7 @@ function calculate-package-report {
   done
   for p in "${!INST_FILE[@]}"
   do
-    [[ ${INST_KNOWN[$p]} ]] || { warn "dependency records unavailable for $p; report incomplete"; return 1; }
+    [[ ${INST_KNOWN[$p]} && ${INST_PROVIDERS_KNOWN[$p]} ]] || { warn "dependency/provider records unavailable for $p; report incomplete"; return 1; }
     [[ ${REPORT_REQUIRED[$p]} ]] || REPORT_ORPHANED[$p]=1
   done
 }

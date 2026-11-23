@@ -477,7 +477,7 @@ categories, available packages and installed packages. Options with values can
 precede the operation. Candidate queries read existing metadata or indexes only:
 no downloads, key setup, package scripts, or package-state changes occur while
 completing. If metadata is missing, run `apt-cyg update` explicitly first.
-`completion-candidates available|installed|categories|commands` exposes this
+`completion-candidates available|installed|categories|commands|options` exposes this
 read-only diagnostic backend.
 
 Inline suggestions use the separately installed
@@ -505,7 +505,7 @@ source /usr/local/share/apt-cyg/zsh-autosuggestions.zsh
 
 Restart Zsh. Tab invokes native completion; zsh-autosuggestions displays an inline
 suggestion that can be accepted with Right Arrow. The integration retains existing
-history/custom strategies and adds an apt-cyg-specific completion strategy. It is
+history/custom strategies and adds an apt-cyg-specific cached-candidate strategy. It is
 safe to source repeatedly. Unrelated commands keep their existing suggestion
 behavior. Without Oh My Zsh, initialize `compinit` after adding the completion
 directory to fpath, load zsh-autosuggestions, then source the integration file.
@@ -514,6 +514,64 @@ Self-update refreshes any installed Bash definition, Zsh definition and inline
 integration from the new script, syntax-checking each and retaining .bak copies.
 The existing persistent/per-update completion opt-out applies to all managed
 shell integration files.
+
+## Virtual dependencies and MobaXterm inline suggestions
+
+Cygwin dependencies can name capabilities rather than separate packages. The
+metadata index includes version-scoped `provides:` declarations. Matching the
+official Setup implementation, `obsoletes:` supplies those capabilities only when
+an explicit `provides:` declaration is absent. For example, installed gcc-core
+can satisfy gcc14, perl_base can satisfy perl5_044, gnupg2 can replace gnupg, and
+libssl1.0 can replace libopenssl100. `_windows` is a synthetic OS capability on a
+native Cygwin host; it is not added to installed.db or downloaded as a package.
+
+The checker, explicit install plans, dependency reports, removal guards and
+autoremove follow actual providers. A provider already installed or explicitly
+included in the same plan can satisfy a virtual requirement. New providers are
+not selected arbitrarily from the repository. Installed-version provider records
+are retained in `.provides` sidecars so metadata expiry does not automatically
+lose that information. Missing provider records, unsupported qualified capability
+relationships, and unsafe provider changes require official Setup. Upgrades cannot
+drop a capability still required by an unchanged installed consumer.
+
+The checker still reports genuinely missing packages, such as an absent libdb18.1.
+Install a genuine missing package through Setup if the normal installer encounters
+versioned dependencies:
+
+```zsh
+apt-cyg setup -- --packages libdb18.1
+```
+
+The inline strategy now reads cached candidates directly. It does not call the
+upstream completion-capture strategy, ZLE completion capture, or zpty. This avoids
+Moba/Cygwin errors such as `can't open pseudo terminal: bad file descriptor`.
+Native Tab completion continues to use the normal Zsh completion system.
+
+To quiet an older installed inline strategy immediately:
+
+```zsh
+ZSH_AUTOSUGGEST_STRATEGY=(history)
+```
+
+After updating, regenerate and reload the integration in the current shell:
+
+```zsh
+apt-cyg self-update
+apt-cyg completion-install --shell zsh --autosuggestions
+source /usr/local/share/apt-cyg/zsh-autosuggestions.zsh
+```
+
+The custom apt_cyg strategy suggests command/option names, package names and simple
+option values using the existing offline backend. It preserves the typed prefix
+and never evaluates shell input. History strategies handle quoted/escaped/complex
+input. If your own configuration also enables the upstream global `completion`
+strategy, that strategy still uses zpty; remove that entry on affected terminals
+and keep `history` plus `apt_cyg` (and any other compatible strategies).
+
+`APT_CYG_WINDOWS_VERSION` is available only with a nonempty alternate root to model
+Windows in isolated fixtures; it does not override native live-root OS detection.
+Provider-aware checks concern capability/package presence. Full version-constraint,
+conflict and provider-choice solving remains the role of official Setup.
 
 ## Operational limits
 
