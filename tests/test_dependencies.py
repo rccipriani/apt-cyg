@@ -190,6 +190,95 @@ class DependencyTests(unittest.TestCase):
         self.assertIn("Cygwin Setup", result.stderr)
         self.assertFalse((self.root / "bin/app.fixture").exists())
 
+    def test_windows_minimum_allows_jq_through_installed_cygwin(self):
+        self.env["APT_CYG_WINDOWS_VERSION"] = "10.0.26100"
+        self.package("cygwin", "_windows ( >= 6.3 ), bash")
+        self.package("bash")
+        self.package("libjq1", "cygwin")
+        self.package("jq", "libjq1")
+        self.db.write_text("INSTALLED.DB 3\ncygwin cygwin-1.0-1.tar.bz2 0\n")
+        self.assert_ok(self.run_install("jq"))
+        self.assert_installed("jq", "libjq1", "bash")
+        self.assertNotIn("_windows", self.flags())
+        self.assertFalse((self.root / "bin/cygwin.fixture").exists())
+
+    def test_windows_minimum_numeric_comparison(self):
+        self.package("app", "_windows (>= 6.3)")
+        for version in ("6.3", "6.10", "10.0.26100"):
+            with self.subTest(version=version):
+                env = dict(self.env, APT_CYG_WINDOWS_VERSION=version)
+                self.assert_ok(self.run_cli("install", "app", "--simulate", env=env))
+        for version in ("6.2", "5.10"):
+            with self.subTest(version=version):
+                env = dict(self.env, APT_CYG_WINDOWS_VERSION=version)
+                result = self.run_cli("install", "app", env=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Windows requirement", result.stderr)
+                self.assertFalse((self.root / "bin/app.fixture").exists())
+
+    def test_windows_build_requirement_is_checked(self):
+        self.package("app", "_windows (>= 10.0.26100)")
+        for version, success in (("10.0.26100", True), ("10.0.26101", True),
+                                 ("10.0.26099", False), ("10.0", False)):
+            with self.subTest(version=version):
+                env = dict(self.env, APT_CYG_WINDOWS_VERSION=version)
+                result = self.run_cli("install", "app", "--simulate", env=env)
+                self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+
+    def test_windows_minimum_uses_native_cygwin_host_version(self):
+        self.package("app", "_windows (>= 6.3)")
+        uname = self.root / "bin/uname"
+        uname.write_text('#!/bin/sh\nprintf "%s\\n" CYGWIN_NT-10.0-26100\n')
+        uname.chmod(0o755)
+        self.assert_ok(self.run_install("app"))
+
+    def test_windows_requirement_fails_on_unknown_or_non_windows_host(self):
+        self.package("app", "_windows (>= 6.3)")
+        for host in ("Linux", "CYGWIN_NT-unknown"):
+            with self.subTest(host=host):
+                uname = self.root / "bin/uname"
+                uname.write_text(f'#!/bin/sh\nprintf "%s\\n" {host}\n')
+                uname.chmod(0o755)
+                result = self.run_install("app")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Windows requirement", result.stderr)
+                self.assertFalse((self.root / "bin/app.fixture").exists())
+
+    def test_windows_exception_does_not_bypass_other_constraints(self):
+        self.env["APT_CYG_WINDOWS_VERSION"] = "10.0.26100"
+        for relation in ("_windows (>= 6.3), liba (>= 2.0)",
+                         "_windows (>= 6.3) | liba", "_windows (< 6.3)",
+                         "_windows (>= 6.3), _windows (>= 11.0)"):
+            with self.subTest(relation=relation):
+                self.metadata = []
+                self.package("app", relation)
+                result = self.run_install("app")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Cygwin Setup", result.stderr)
+                self.assertFalse((self.root / "bin/app.fixture").exists())
+
+    def test_unchanged_installed_dependency_uses_its_own_relations(self):
+        self.package("liba", "missing (>= 2.0)", version="2.0-1",
+                     extra="[prev]\nversion: 1.0-1\ninstall: x86_64/release/liba/liba-1.0-1.tar.xz 1 abc\ndepends2:")
+        self.package("app", "liba")
+        self.db.write_text("INSTALLED.DB 3\nliba liba-1.0-1.tar.bz2 0\n")
+        self.assert_ok(self.run_install("app"))
+        self.assert_installed("app")
+        # Upgrade validates the selected new version and rejects its constraint.
+        result = self.run_cli("upgrade", "liba")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("versioned or alternative", result.stderr)
+
+    def test_installed_constraints_are_not_hidden_by_current_metadata(self):
+        self.package("liba", version="2.0-1",
+                     extra="[prev]\nversion: 1.0-1\ninstall: x86_64/release/liba/liba-1.0-1.tar.xz 1 abc\ndepends2: missing (>= 2.0)")
+        self.package("app", "liba")
+        self.db.write_text("INSTALLED.DB 3\nliba liba-1.0-1.tar.bz2 0\n")
+        result = self.run_install("app")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("versioned or alternative", result.stderr)
+        self.assertFalse((self.root / "bin/app.fixture").exists())
+
     def test_failed_postinstall_remains_retryable(self):
         self.package("app")
         script = self.postinstall / "app.sh"
@@ -1573,3 +1662,4 @@ suggestion=''; _zsh_autosuggest_strategy_apt_cyg 'apt-cyg install $(touch should
 
 if __name__ == "__main__":
     unittest.main()
+

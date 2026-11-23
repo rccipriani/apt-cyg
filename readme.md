@@ -65,8 +65,12 @@ older version if the repository's current version is older.
 
 Dependencies prefer `depends2`, then `depends`, then legacy `requires`.
 Explicit current sections are honored; test/previous sections are excluded from
-the current index. Version constraints and alternative dependencies are rejected
-before extraction: use official Setup for those packages. `--nodeps` explicitly
+the current index. `_windows (>= VERSION)` requirements are checked against the
+native Cygwin host's Windows version (including a build number when specified).
+An unknown or insufficient OS version fails before extraction. Other version
+constraints and alternative dependencies require official Setup. Unchanged installed
+dependencies are validated against their installed-version metadata, rather than
+the repository's current version. `--nodeps` explicitly
 bypasses dependency handling; `--noscripts` explicitly skips package scripts.
 
 ## Tracking and removal
@@ -207,7 +211,8 @@ Repository metadata is still needed to resolve dependencies.
 can be installed together; dependencies are planned before extraction. Absolute
 and parent-traversal archive member paths are rejected. Requested local packages
 become manual picks. Their dependency records are retained for removal checks.
-Version constraints and alternatives continue to require official Setup.
+Other version constraints and alternatives continue to require official Setup;
+the verified `_windows (>= VERSION)` exception described above also applies here.
 
 ## Official Setup and files in use
 
@@ -604,3 +609,4 @@ download fallback, completion, self-update backup/validation, local archive trus
 integrity repair, Setup verification/argument forwarding, source downloads, proxy
 selection, parallel mirrors, diagnostics, and richer queries. They do not
 exercise Windows DLL locking, rebasing, or native Cygwin package scripts.
+
