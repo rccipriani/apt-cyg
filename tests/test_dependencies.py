@@ -537,6 +537,274 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual((self.root / "order").read_text().splitlines()[-2:],
                          ["0p_first.dash", "zp_last.dash"])
 
+    def test_check_repairs_missing_dependency_and_files(self):
+        self.package("app", "liba")
+        self.package("liba")
+        self.assert_ok(self.run_install("app"))
+        self.db.write_text("\n".join(row for row in self.db.read_text().splitlines()
+                                     if not row.startswith("liba ")) + "\n")
+        (self.root / "bin/app.fixture").unlink()
+        before = self.db.read_bytes()
+        result = self.run_cli("check", "--files")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing dependency liba", result.stderr)
+        self.assertIn("missing or invalid file", result.stderr)
+        self.assert_ok(self.run_cli("check", "--files", "--fix", "--simulate"))
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertFalse((self.root / "bin/app.fixture").exists())
+        self.assert_ok(self.run_cli("check", "--files", "--fix", "--yes"))
+        self.assert_installed("app", "liba")
+        self.assertTrue((self.root / "bin/app.fixture").exists())
+        self.assertEqual(self.flags()["liba"], "0")
+
+    def test_check_repairs_missing_manifest_and_pending_script(self):
+        self.package("app")
+        self.assert_ok(self.run_install("app"))
+        (self.setup / "app.lst.gz").unlink()
+        script = self.postinstall / "app.sh"
+        script.write_text('echo repaired > "$APT_CYG_ROOT/script-repaired"\n')
+        self.assert_ok(self.run_cli("check", "--fix", "--yes"))
+        self.assertTrue((self.setup / "app.lst.gz").exists())
+        self.assertTrue((self.root / "script-repaired").exists())
+
+    def test_check_refuses_to_rewrite_malformed_or_duplicate_database(self):
+        self.package("app")
+        for text in ("invalid\n", "INSTALLED.DB 3\napp app-1.0-1.tar.xz 1\napp app-1.0-1.tar.xz 0\n"):
+            self.db.write_text(text)
+            self.assertNotEqual(self.run_cli("check", "--fix").returncode, 0)
+            self.assertEqual(self.db.read_text(), text)
+
+    def test_localinstall_authenticated_archive_resolves_dependencies(self):
+        archive = self.package("app", "liba")
+        self.package("liba")
+        self.assert_ok(self.run_cli("localinstall", str(archive), "--yes"))
+        self.assertEqual(self.flags(), {"app": "1", "liba": "0"})
+        self.assertIn("app app-1.0-1.tar.xz", self.db.read_text())
+
+    def test_localinstall_requires_explicit_trust_and_hint(self):
+        self.package("keep")
+        archive = self.package("local", "keep")
+        self.metadata.pop()
+        self.assertNotEqual(self.run_cli("localinstall", str(archive)).returncode, 0)
+        self.assertNotEqual(self.run_cli("localinstall", str(archive), "--allow-untrusted").returncode, 0)
+        hint = archive.with_name(archive.name.replace(".tar.xz", ".hint"))
+        hint.write_text("depends2: keep\n")
+        self.assert_ok(self.run_cli("localinstall", str(archive), "--allow-untrusted", "--simulate"))
+        self.assertEqual(self.flags(), {})
+        self.assert_ok(self.run_cli("localinstall", str(archive), "--allow-untrusted", "--yes"))
+        self.assertEqual(self.flags(), {"local": "1", "keep": "0"})
+
+    def test_localinstall_rejects_authentication_mismatch_even_with_override(self):
+        archive = self.package("app")
+        archive.write_bytes(archive.read_bytes() + b"tampering")
+        result = self.run_cli("localinstall", str(archive), "--allow-untrusted")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.flags(), {})
+
+    def test_localinstall_rejects_traversal_and_constrained_hints(self):
+        self.package("keep")
+        archive = self.root / "unsafe-1.0-1.tar.xz"
+        with tarfile.open(archive, "w:xz") as tar:
+            info = tarfile.TarInfo("../outside")
+            info.size = 1
+            tar.addfile(info, io.BytesIO(b"x"))
+        self.assertNotEqual(self.run_cli("localinstall", str(archive), "--allow-untrusted").returncode, 0)
+        archive = self.package("local")
+        self.metadata.pop()
+        archive.with_name(archive.name.replace(".tar.xz", ".hint")).write_text("depends2: keep (>= 2)\n")
+        self.assertNotEqual(self.run_cli("localinstall", str(archive), "--allow-untrusted").returncode, 0)
+
+    def test_source_download_checks_authenticated_digest(self):
+        self.package("app")
+        source = self.mirror / "x86_64/release/app/app-1.0-1-src.tar.xz"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"fixture source archive")
+        relative = source.relative_to(self.mirror).as_posix()
+        digest = hashlib.sha512(source.read_bytes()).hexdigest()
+        self.metadata[-1] += f"source: {relative} {source.stat().st_size} {digest}\n"
+        result = self.run_cli("source", "app")
+        self.assert_ok(result)
+        cached = self.mirror_cache / relative
+        self.assertEqual(cached.read_bytes(), source.read_bytes())
+        self.assert_ok(self.run_cli("mirror-source", "app"))
+        source.write_bytes(b"bad source")
+        cached.unlink()
+        self.assertNotEqual(self.run_cli("source", "app").returncode, 0)
+
+    def test_key_removal_does_not_rebootstrap_deleted_last_key(self):
+        destination = self.setup / "keys.gpg"
+        destination.write_bytes(self.keyring.read_bytes())
+        output = subprocess.check_output(["gpg", "--batch", "--homedir", str(self.signer),
+                                          "--with-colons", "--list-keys"], text=True)
+        fingerprint = next(row.split(":")[9] for row in output.splitlines() if row.startswith("fpr:"))
+        env = dict(self.env, APT_CYG_KEYRING=str(destination))
+        self.assertNotEqual(self.run_cli("key-del", fingerprint[-8:], env=env).returncode, 0)
+        self.assert_ok(self.run_cli("key-del", fingerprint, "--simulate", env=env))
+        self.assertGreater(destination.stat().st_size, 0)
+        self.assert_ok(self.run_cli("key-del", fingerprint, env=env))
+        self.assertEqual(destination.read_bytes(), b"")
+        self.package("app")
+        self.assertNotEqual(self.run_cli("install", "app", env=env).returncode, 0)
+
+    def test_parallel_mirror_benchmark_and_recorded_details(self):
+        self.package("app")
+        self.publish_mirror_metadata()
+        with (self.setup / "setup.rc").open("a") as config:
+            config.write(f"mirrors-lst\n\t{self.mirror_url};Fixture;North America;US\n")
+        result = self.run_cli("benchmark-parallel-mirrors", self.mirror_url, self.mirror_url, "--max-jobs", "2")
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.count(self.mirror_url), 2)
+        self.assert_ok(self.run_cli("benchmark-parallel-mirrors-list"))
+        self.assertIn(";Fixture;", self.run_cli("mirrors-list-long").stdout)
+        self.assertNotEqual(self.run_cli("benchmark-parallel-mirrors", "--max-jobs", "0").returncode, 0)
+
+    def test_online_mirror_discovery(self):
+        fixture = self.root / "mirrors"
+        fixture.write_text("https://one.invalid/cygwin;One;Europe;DE\nhttps://two.invalid/cygwin;Two;Asia;JP\n")
+        self.mock_downloader("wget", 'while (( $# )); do if [[ $1 == -O ]]; then out=$2; shift; fi; shift; done\ncp "$MIRROR_FIXTURE" "$out"')
+        env = dict(self.env, APT_CYG_DOWNLOADER="wget", MIRROR_FIXTURE=str(fixture))
+        result = self.run_cli("mirrors-list-online", env=env)
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.splitlines(), ["https://one.invalid/cygwin", "https://two.invalid/cygwin"])
+        self.assertIn(";Europe;", self.run_cli("mirrors-list-online", "--long", env=env).stdout)
+
+    def test_description_search_case_folding_and_package_file(self):
+        self.package("app", extra='sdesc: "Text Editor"\nldesc: "Edit multi-line\nnotes"\ncategory: Editors Utils')
+        self.assertIn("app - Text Editor", self.run_cli("describe", "multi-line.*notes").stdout)
+        self.assertNotIn("app -", self.run_cli("describe", "TEXT EDITOR").stdout)
+        self.assertIn("app - Text Editor", self.run_cli("describe", "TEXT EDITOR", "--ignore-case").stdout)
+        self.assertEqual(self.run_cli("find", "APP", "-i").stdout.strip(), "app")
+        self.assertIn("Editors", self.run_cli("ls-categories").stdout)
+        targets = self.root / "packages.txt"
+        targets.write_bytes(b"# comment\r\napp\r\n")
+        self.assert_ok(self.run_cli("install", "--file", str(targets), "--yes"))
+        self.assert_installed("app")
+
+    def test_statistics_and_resolved_paths(self):
+        self.package("app")
+        self.assert_ok(self.run_install("app"))
+        result = self.run_cli("stats")
+        self.assert_ok(result)
+        self.assertIn("available-packages\t1", result.stdout)
+        self.assertIn("installed-packages\t1", result.stdout)
+        self.assertEqual(self.run_cli("packages-cached-count").stdout.strip(), "1")
+        self.assertEqual(self.run_cli("packages-total-count").stdout.strip(), "1")
+        self.assertEqual(self.run_cli("pathof", "database").stdout.strip(), str(self.db))
+        self.assertEqual(self.run_cli("pathof", "root").stdout.strip(), str(self.root))
+        self.assertIn(str(self.executable), self.run_cli("scriptinfo").stdout)
+
+    def test_quiet_verbose_and_transient_configuration(self):
+        self.package("app")
+        config = (self.setup / "setup.rc").read_bytes()
+        self.assertEqual(self.run_cli("listall", "app", "--quiet").stdout, "")
+        self.assertIn("Command: listall", self.run_cli("listall", "app", "--verbose").stderr)
+        result = self.run_cli("pathof", "mirror", "--mirror", "https://temporary.invalid")
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.strip(), "https://temporary.invalid")
+        cache = self.root / "temporary cache"
+        self.assertEqual(self.run_cli("pathof", "cache", "--cache", str(cache)).stdout.strip(), str(cache))
+        self.assertEqual((self.setup / "setup.rc").read_bytes(), config)
+
+    def test_proxy_modes_reach_downloader_without_logging_credentials(self):
+        self.mock_downloader("wget", 'while (( $# )); do if [[ $1 == -O ]]; then out=$2; shift; fi; shift; done\nprintf "%s" "${https_proxy:-unset}" > "$out"')
+        self.package("app")
+        inherited = dict(self.env, APT_CYG_DOWNLOADER="wget", https_proxy="http://inherited.invalid")
+        # A full setup.xz download is used as a harmless observable request.
+        for mode, expected_bytes in (("inherit", 24), ("none", 5), ("http://proxy.invalid:8080", 25)):
+            result = self.run_cli("benchmark-mirrors", "https://fixture.invalid", "--proxy", mode, env=inherited)
+            self.assert_ok(result)
+            self.assertIn(f"\t{expected_bytes}\t", result.stdout)
+
+    def test_setup_download_always_requires_signature(self):
+        executable = self.root / "setup.fixture"
+        executable.write_bytes(b"MZ fixture executable")
+        subprocess.run(["gpg", "--batch", "--yes", "--homedir", str(self.signer), "--detach-sign",
+                        "--output", str(executable) + ".sig", str(executable)], check=True, capture_output=True)
+        self.mock_downloader("wget", 'while (( $# )); do if [[ $1 == -O ]]; then out=$2; shift; else url=$1; fi; shift; done\ncase $url in *.sig) cp "$SETUP_FIXTURE.sig" "$out" ;; *) cp "$SETUP_FIXTURE" "$out" ;; esac')
+        env = dict(self.env, APT_CYG_DOWNLOADER="wget", SETUP_FIXTURE=str(executable))
+        result = self.run_cli("update-setup", env=env)
+        self.assert_ok(result)
+        installed = self.setup / "setup-bin/setup-x86_64.exe"
+        self.assertEqual(installed.read_bytes(), executable.read_bytes())
+        Path(str(executable) + ".sig").write_bytes(b"invalid signature")
+        self.assertNotEqual(self.run_cli("update-setup", "--no-verify", env=env).returncode, 0)
+        self.assertEqual(installed.read_bytes(), b"MZ fixture executable")
+
+    def test_setup_simulation_and_root_guard(self):
+        result = self.run_cli("dist-upgrade", "--simulate", "--", "--no-admin")
+        self.assert_ok(result)
+        self.assertIn("--upgrade-also", result.stdout)
+        self.assertIn(str(self.root), result.stdout)
+        self.assertFalse((self.setup / "setup-bin").exists())
+        result = self.run_cli("setup", "--simulate", "--", "--root", "C:/wrong")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_busy_diagnostics_observe_mapped_executable(self):
+        import shutil
+        self.package("app")
+        self.assert_ok(self.run_install("app"))
+        executable = self.root / "bin/app.fixture"
+        shutil.copyfile(shutil.which("sleep"), executable)
+        executable.chmod(0o755)
+        process = subprocess.Popen([str(executable), "20"])
+        try:
+            time.sleep(0.1)
+            result = self.run_cli("busy", "app")
+            self.assert_ok(result)
+            self.assertIn(f"busy\tapp\tpid={process.pid}", result.stdout)
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+
+    def test_setup_native_argument_forwarding_and_exit_status(self):
+        directory = self.setup / "setup-bin"
+        directory.mkdir()
+        executable = directory / "setup-x86_64.exe"
+        # A signed shell stand-in tests argument plumbing; it is not a native PE test.
+        executable.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$APT_CYG_ROOT/setup.args"\nexit "${SETUP_STATUS:-0}"\n')
+        executable.chmod(0o755)
+        subprocess.run(["gpg", "--batch", "--yes", "--homedir", str(self.signer), "--detach-sign",
+                        "--output", str(executable) + ".sig", str(executable)], check=True, capture_output=True)
+        self.mock_downloader("uname", "printf CYGWIN_NT-10.0")
+        self.mock_downloader("cygpath", "printf 'C:/Fixture Root'")
+        self.assert_ok(self.run_cli("setup", "--", "--no-admin"))
+        self.assertEqual((self.root / "setup.args").read_text().splitlines(),
+                         ["--no-admin", "--root", "C:/Fixture Root", "--wait"])
+        result = self.run_cli("setup", env=dict(self.env, SETUP_STATUS="7"))
+        self.assertEqual(result.returncode, 7)
+        self.assertFalse((self.setup / ".apt-cyg.lock").exists())
+        executable.write_text("#!/bin/bash\nexit 0\n")
+        self.assertNotEqual(self.run_cli("setup").returncode, 0)
+
+    def test_context_options_and_setup_root_abbreviations_are_rejected(self):
+        for arguments in (("install", "app", "--fix"), ("list", "--allow-untrusted"),
+                          ("setup", "--simulate", "--", "-R", "wrong"),
+                          ("setup", "--simulate", "--", "--roo=wrong"),
+                          ("setup", "--simulate", "--", "-qRwrong")):
+            with self.subTest(arguments=arguments):
+                self.assertNotEqual(self.run_cli(*arguments).returncode, 0)
+
+    def test_alternative_dependency_is_rejected_with_extended_index(self):
+        self.package("app", "liba | libb")
+        self.package("liba")
+        self.package("libb")
+        result = self.run_install("app")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.flags(), {})
+
+    def test_check_fix_preserves_setup_dependency_constraints(self):
+        self.package("app")
+        self.assert_ok(self.run_install("app"))
+        (self.setup / "app.deps").unlink()
+        self.metadata = []
+        self.package("app", "liba (>= 2)")
+        self.package("liba")
+        before = self.db.read_bytes()
+        result = self.run_cli("check", "--fix", "--yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cygwin Setup", result.stderr)
+        self.assertEqual(self.db.read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

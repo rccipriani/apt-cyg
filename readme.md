@@ -165,6 +165,153 @@ apt-cyg search cygjq-1.dll
 A single-pass parsed metadata index is cached until metadata changes. See
 `apt-cyg --help` for command options and environment overrides.
 
+## Integrity checks and repair
+
+```bash
+apt-cyg check
+apt-cyg check --files
+apt-cyg check --files --fix --simulate
+apt-cyg check --files --fix --yes
+```
+
+`check` validates database structure and duplicate entries, readable manifests,
+installed-version dependencies, and pending one-shot postinstall scripts.
+`--files` additionally checks that manifest-listed files exist; it does not
+compare individual file contents or treat local configuration edits as damage.
+Optional package names restrict package checks; pending scripts are still checked
+globally. A clean check returns zero; problems return nonzero.
+
+`--fix` prepares a normal dependency/reinstall plan for missing dependencies and
+broken packages, then retries pending scripts and rechecks. Reinstalled versions
+must still be in authenticated metadata. Malformed databases and unavailable
+installed-version dependency records require manual repair or official Setup.
+Repairs use the same writer lock, verification, and simulation rules as installs.
+
+## Local packages
+
+```bash
+apt-cyg localinstall ./example-1.0-1.tar.xz --simulate
+apt-cyg localinstall ./example-1.0-1.tar.xz
+apt-cyg localinstall ./private-1.0-1.tar.xz --allow-untrusted
+```
+
+A local archive whose name/version exists in repository metadata must match that
+metadata's digest. For a private archive absent from metadata, explicitly supply
+`--allow-untrusted` and an adjacent `private-1.0-1.hint` file containing
+`depends2:`, `depends:`, or `requires:` (an empty list must be declared explicitly).
+This trusts the archive, its package scripts, and its dependency hint. The option
+does not bypass a checksum mismatch for an archive advertised by the repository.
+Repository metadata is still needed to resolve dependencies.
+
+`--name NAME` overrides name inference for one archive. Multiple local archives
+can be installed together; dependencies are planned before extraction. Absolute
+and parent-traversal archive member paths are rejected. Requested local packages
+become manual picks. Their dependency records are retained for removal checks.
+Version constraints and alternatives continue to require official Setup.
+
+## Official Setup and files in use
+
+```bash
+apt-cyg busy jq vim
+apt-cyg update-setup
+apt-cyg setup --simulate -- --no-admin
+apt-cyg setup -- --no-admin --packages jq
+apt-cyg dist-upgrade --simulate -- --no-admin
+apt-cyg dist-upgrade -- --no-admin
+```
+
+`show-packages-busyness` is an alias for `busy`. These commands observe package
+files mapped by processes and report matching PIDs. `no-observed-use` does not
+prove a file is unlocked: Windows processes and inaccessible process maps may
+be invisible. Diagnostics never open package files for writing or kill processes.
+
+`update-setup` downloads official `setup-ARCH.exe` and its detached signature
+into `/etc/setup/setup-bin`. Signature verification is mandatory even when
+`--no-verify` was supplied for metadata. `setup` verifies the cached installer
+again before launching it, downloading it first if absent. Launching requires
+native Cygwin and `cygpath`; downloading and simulation can run in fixture roots.
+Native options must follow `--` so apt-cyg does not interpret them.
+
+The wrapper fixes `--root` to the active Cygwin installation, rejects root
+overrides, passes `--wait`, and propagates the installer's exit status.
+`dist-upgrade` adds `--upgrade-also`. These launch the installer without forcing
+unattended mode or terminating Cygwin processes. Close Cygwin applications for
+runtime/DLL updates and follow Setup's prompts; a reboot may be required. Setup
+uses its own downloader/proxy options, independently of apt-cyg's HTTP clients.
+
+## Additional mirror, trust, and source tools
+
+```bash
+apt-cyg mirrors-list-online
+apt-cyg mirrors-list-online --long
+apt-cyg mirrors-list-long
+apt-cyg benchmark-parallel-mirrors URL1 URL2 --max-jobs 4
+apt-cyg benchmark-parallel-mirrors-list --max-jobs 4
+apt-cyg key-finger
+apt-cyg key-del FULL_PRIMARY_KEY_FINGERPRINT
+apt-cyg source jq
+```
+
+Parallel benchmarking uses bounded batches (1 to 64 workers, default 4), sorts
+successful measurements, reports failures, and returns nonzero if any mirror
+fails. The `-list` variant uses recorded mirrors. Online discovery fetches the
+official HTTPS mirror list; `--long` preserves full semicolon-delimited records.
+No mirror is selected automatically.
+
+`key-del` requires a full fingerprint and changes only the dedicated trusted
+keyring. Deleting the last key leaves an explicitly empty keyring; verification
+fails until a trusted key is explicitly added, rather than silently restoring it.
+`key-finger` aliases `key-list`.
+
+`source` and its alias `mirror-source` download current source archives into the
+configured mirror cache, verify their metadata digests, and print their paths.
+They do not install or build sources. The metadata index now includes source
+records and archive sizes; old indexes rebuild automatically.
+
+## Search, configuration, and diagnostics
+
+```bash
+apt-cyg describe 'editor|JSON'
+apt-cyg describe 'TEXT EDITOR' --ignore-case
+apt-cyg find 'VIM' -i
+apt-cyg ls-categories
+apt-cyg install --file packages.txt
+apt-cyg update --mirror URL --cache /path/to/temporary-cache
+apt-cyg update --proxy http://proxy.example:8080
+apt-cyg update --proxy none
+apt-cyg listall vim --quiet
+apt-cyg listall vim --verbose
+apt-cyg stats
+apt-cyg pathof root database cache setup.ini
+apt-cyg scriptinfo
+```
+
+`describe` searches names plus short/long descriptions using regular expressions;
+`find` aliases `listall`. `--ignore-case` applies to list/find/describe matching.
+`--file` appends one target per line, accepts CRLF, and skips empty lines and
+lines starting with `#`. It can be repeated.
+
+`--mirror` and `--cache` override configuration only for the current invocation.
+`--proxy` accepts `inherit` (default), `none`, or an HTTP/HTTPS/SOCKS5 proxy URL
+(the downloader must support the selected protocol). Proxy selection applies
+to apt-cyg downloads, with no automatic WPAD lookup or PAC-script execution.
+`--quiet` suppresses stdout and progress; errors remain on stderr. `--verbose`
+prints the operation, root, database, and selected downloader. `--no-progress`
+disables progress bars while retaining normal output.
+
+`stats` reports available and installed package counts plus archive counts/sizes
+for the selected mirror cache. Sizes are compressed archive bytes, not installed
+disk usage. Individual queries are `packages-total-count`, `packages-total-size`,
+`packages-cached-count`, and `packages-cached-size`. `pathof` accepts `root`,
+`database`, `cache`, `mirror`, `mirrordir`, `setup.ini`, `keyring`, and `setup`.
+`scriptinfo` includes the resolved executable path and downloader.
+
+These additional operations are adapted to our trust and tracking model from
+features documented by [apt-cyg2](https://github.com/zensage/apt-cyg2) and
+[kou1okada/apt-cyg](https://github.com/kou1okada/apt-cyg). The latter's destructive
+process termination, write-open lock probes, and simplistic WPAD discovery are
+not used.
+
 ## Operational limits
 
 Mutating commands take an atomic directory lock at `/etc/setup/.apt-cyg.lock`;
@@ -192,5 +339,7 @@ Tests require Python 3, Bash, GPG, and the listed GNU tools. They generate a
 fixture signing key and operate on isolated alternate roots with local package
 archives. They cover dependency repair, plans, tracking, upgrade/reinstall,
 removal, locking, signature checks, compression fallback, cached indexing,
-download fallback, completion, and self-update backup/validation. They do not
+download fallback, completion, self-update backup/validation, local archive trust,
+integrity repair, Setup verification/argument forwarding, source downloads, proxy
+selection, parallel mirrors, diagnostics, and richer queries. They do not
 exercise Windows DLL locking, rebasing, or native Cygwin package scripts.
