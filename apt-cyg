@@ -889,13 +889,37 @@ function load-installed-dependencies {
 }
 
 function windows-present {
+  local host
   if [[ ! -v WINDOWS_PRESENT ]]
   then
     WINDOWS_PRESENT=0
-    if [[ $ROOT && ${APT_CYG_WINDOWS_VERSION:-} =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || [[ $(uname -s) == CYGWIN_NT-* ]]
-    then WINDOWS_PRESENT=1; fi
+    WINDOWS_VERSION=
+    if [[ $ROOT && ${APT_CYG_WINDOWS_VERSION:-} =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]
+    then WINDOWS_PRESENT=1; WINDOWS_VERSION=$APT_CYG_WINDOWS_VERSION
+    else
+      host=$(uname -s)
+      if [[ $host == CYGWIN_NT-* ]]
+      then
+        WINDOWS_PRESENT=1
+        if [[ $host =~ ^CYGWIN_NT-([0-9]+\.[0-9]+)(-([0-9]+))?($|-) ]]
+        then WINDOWS_VERSION=${BASH_REMATCH[1]}${BASH_REMATCH[3]:+.${BASH_REMATCH[3]}}; fi
+      fi
+    fi
   fi
   [[ $WINDOWS_PRESENT == 1 ]]
+}
+
+function windows-at-least {
+  windows-present && [[ $WINDOWS_VERSION ]] || return 1
+  # OS versions are numeric components, not package versions or decimal numbers.
+  current=$WINDOWS_VERSION required=$1 gawk 'BEGIN {
+    n=split(ENVIRON["current"], a, "."); m=split(ENVIRON["required"], b, ".")
+    for(i=1; i<=n || i<=m; i++) {
+      if(a[i]+0 > b[i]+0) exit 0
+      if(a[i]+0 < b[i]+0) exit 1
+    }
+    exit 0
+  }'
 }
 
 function dependency-provider {
@@ -926,13 +950,28 @@ function dependency-provider {
 }
 
 function validate-dependencies {
-  local p=$1 d
-  if [[ ${IDX_REL[$p]} == *['()|']* ]]
+  local p=$1 d clause checked= relation=${3-${IDX_REL[$1]}} deps=${2-${IDX_DEPS[$1]}}
+  local windows_requirement='^[[:space:]]*_windows[[:space:]]*\([[:space:]]*>=[[:space:]]*([0-9]+\.[0-9]+(\.[0-9]+)?)[[:space:]]*\)[[:space:]]*$'
+  local -a clauses
+  IFS=, read -r -a clauses <<< "$relation"
+  for clause in "${clauses[@]}"
+  do
+    if [[ $clause =~ $windows_requirement ]]
+    then
+      windows-at-least "${BASH_REMATCH[1]}" || {
+        warn "Windows requirement for $p is not satisfied or cannot be verified: $clause; use Cygwin Setup"
+        return 1
+      }
+      clause=_windows
+    fi
+    checked+="$clause,"
+  done
+  if [[ $checked == *['()|']* ]]
   then
-    warn "versioned or alternative dependencies for $p require Cygwin Setup: ${IDX_REL[$p]}"
+    warn "versioned or alternative dependencies for $p require Cygwin Setup: $relation"
     return 1
   fi
-  for d in ${IDX_DEPS[$p]}
+  for d in $deps
   do
     [[ $d =~ ^[A-Za-z0-9_+.-]+$ ]] || { warn "invalid dependency for $p: $d"; return 1; }
   done
@@ -1208,7 +1247,7 @@ function fetch-package {
 }
 
 function plan-visit {
-  local p=$1 d deps
+  local p=$1 d deps relation
   if [[ $p == _windows ]] && windows-present; then return 0; fi
   if ! is-installed "$p" && dependency-provider "$p"
   then
@@ -1224,13 +1263,15 @@ function plan-visit {
   fi
   if [[ ! -v nodeps ]]
   then
-    validate-dependencies "$p" || return 1
     deps=${IDX_DEPS[$p]}
+    relation=${IDX_REL[$p]}
     if is-installed "$p" && [[ ! ${UPG_SET[$p]} && ! ${REINST_SET[$p]} ]]
     then
       [[ ${INST_KNOWN[$p]} ]] || { warn "installed dependency metadata unavailable for $p; use Cygwin Setup"; return 1; }
       deps=${INST_DEPS[$p]}
+      relation=${INST_REL[$p]}
     fi
+    validate-dependencies "$p" "$deps" "$relation" || return 1
     for d in $deps
     do
       plan-visit "$d" || return 1
@@ -3403,3 +3444,4 @@ else
   printf '%s' "$usage"
   exit 1
 fi
+
