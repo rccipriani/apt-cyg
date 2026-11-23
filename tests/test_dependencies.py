@@ -805,6 +805,416 @@ class DependencyTests(unittest.TestCase):
         self.assertIn("Cygwin Setup", result.stderr)
         self.assertEqual(self.db.read_bytes(), before)
 
+    def test_perpetual_repair_restores_historical_done_scripts_with_backup(self):
+        script = self.postinstall / "0p_repair.dash.done"
+        script.write_text('echo repaired > "$APT_CYG_ROOT/perpetual-ran"\n')
+        self.assert_ok(self.run_cli("repair-postinstall", "--simulate"))
+        self.assertTrue(script.exists())
+        self.assert_ok(self.run_cli("repair-postinstall", "--yes"))
+        self.assertFalse(script.exists())
+        self.assertTrue((self.postinstall / "0p_repair.dash").exists())
+        self.assertEqual(len(list((self.setup / "postinstall-backups").glob("*/*.done"))), 1)
+        self.assertFalse((self.root / "perpetual-ran").exists())
+
+    def test_check_fix_runs_restored_perpetual_script(self):
+        self.package("app")
+        self.assert_ok(self.run_install("app"))
+        (self.postinstall / "zp_old.sh.done").write_text('echo restored > "$APT_CYG_ROOT/ran"\n')
+        self.assertNotEqual(self.run_cli("check").returncode, 0)
+        self.assert_ok(self.run_cli("check", "--fix", "--yes"))
+        self.assertTrue((self.root / "ran").exists())
+        self.assertFalse((self.postinstall / "zp_old.sh.done").exists())
+
+    def test_perpetual_repair_keeps_newer_active_script(self):
+        completed = self.postinstall / "0p_old.sh.done"
+        active = self.postinstall / "0p_old.sh"
+        completed.write_text("old\n")
+        active.write_text("new\n")
+        os.utime(completed, (1, 1))
+        self.assert_ok(self.run_cli("repair-postinstall"))
+        self.assertEqual(active.read_text(), "new\n")
+        self.assertFalse(completed.exists())
+
+    def test_targeted_acl_repair_backs_up_and_does_not_recurse(self):
+        target = self.root / "limited"
+        target.mkdir()
+        child = target / "child"
+        child.write_text("data")
+        child.chmod(0o400)
+        target.chmod(0o500)
+        self.mock_downloader("getfacl", 'printf "user::r-x\\ngroup::---\\nother::---\\n"')
+        self.assertNotEqual(self.run_cli("repair-acl").returncode, 0)
+        self.assert_ok(self.run_cli("repair-acl", str(target), "--simulate"))
+        self.assertEqual(target.stat().st_mode & 0o777, 0o500)
+        self.assert_ok(self.run_cli("repair-acl", str(target), "--yes"))
+        self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(child.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(len(list((self.setup / "acl-backups").glob("*/*.acl"))), 1)
+        link = self.root / "link"
+        link.symlink_to(child)
+        self.assertNotEqual(self.run_cli("repair-acl", str(link)).returncode, 0)
+
+    def test_cached_owner_index_reused_and_invalidated_by_package_removal(self):
+        self.package("app", files={"usr/bin/app.exe": "app"})
+        self.package("other")
+        self.assert_ok(self.run_install("app", "other"))
+        result = self.run_cli("packageof", "APP", "-i")
+        self.assert_ok(result)
+        self.assertIn("app: /usr/bin/app.exe", result.stdout)
+        index = self.setup / "apt-cyg-owners.idx"
+        stamp = index.stat().st_mtime_ns
+        self.assert_ok(self.run_cli("packageof", "app"))
+        self.assertEqual(index.stat().st_mtime_ns, stamp)
+        self.assert_ok(self.run_cli("remove", "other", "--yes"))
+        self.assert_ok(self.run_cli("packageof", "other"))
+        self.assertNotIn("other:", index.read_text())
+        self.assertNotEqual(index.stat().st_mtime_ns, stamp)
+
+    def test_cached_owner_index_detects_manifest_content_change(self):
+        self.package("app")
+        self.assert_ok(self.run_install("app"))
+        self.assert_ok(self.run_cli("packageof", "app"))
+        manifest = self.setup / "app.lst.gz"
+        manifest.write_bytes(gzip.compress(b"bin/changed name.exe\n"))
+        result = self.run_cli("packageof", "changed name")
+        self.assert_ok(result)
+        self.assertIn("app: /bin/changed name.exe", result.stdout)
+
+    def install_web_downloader(self):
+        fixture = self.root / "web"
+        fixture.mkdir(exist_ok=True)
+        self.mock_downloader("wget", '''while (( $# )); do
+if [[ $1 == -O ]]; then out=$2; shift; else url=$1; fi; shift; done
+printf '%s\\n' "$url" >> "$APT_CYG_ROOT/web.requests"
+case $url in
+*package-grep.cgi*) cp "$APT_CYG_ROOT/web/query" "$out" ;;
+*summary/app-src.html) cp "$APT_CYG_ROOT/web/source-summary" "$out" ;;
+*summary/app.html) cp "$APT_CYG_ROOT/web/summary" "$out" ;;
+*/app/app-1.0-1) cp "$APT_CYG_ROOT/web/filelist" "$out" ;;
+*) exit 1 ;;
+esac''')
+        self.env["APT_CYG_DOWNLOADER"] = "wget"
+        return fixture
+
+    def test_web_filelist_and_filesearch_cache_without_package_archive(self):
+        archive = self.package("app")
+        archive.unlink()
+        web = self.install_web_downloader()
+        (web / "filelist").write_text('<pre>\n2026-01-01 12:00 10 usr/bin/example&amp;tool.exe\n</pre>\n')
+        (web / "query").write_text("Found 1 matches\napp-1.0-1 Fixture package\n")
+        result = self.run_cli("filelist", "app")
+        self.assert_ok(result)
+        self.assertIn("app: /usr/bin/example&tool.exe", result.stdout)
+        requests = (self.root / "web.requests").read_text().splitlines()
+        self.assert_ok(self.run_cli("filelist", "app"))
+        self.assertEqual((self.root / "web.requests").read_text().splitlines(), requests)
+        result = self.run_cli("filesearch", "example")
+        self.assert_ok(result)
+        self.assertIn("app: /usr/bin/example&tool.exe", result.stdout)
+        count = len((self.root / "web.requests").read_text().splitlines())
+        self.assert_ok(self.run_cli("filesearch", "example"))
+        self.assertEqual(len((self.root / "web.requests").read_text().splitlines()), count)
+        self.assertFalse(archive.exists())
+        self.assertEqual(self.flags(), {})
+
+    def test_web_refresh_and_offline_cache(self):
+        self.package("app")
+        web = self.install_web_downloader()
+        page = web / "filelist"
+        page.write_text('<pre>\n2026-01-01 12:00 1 usr/bin/old.exe\n</pre>\n')
+        self.assert_ok(self.run_cli("filelist", "app"))
+        page.write_text('<pre>\n2026-01-01 12:00 1 usr/bin/new.exe\n</pre>\n')
+        result = self.run_cli("filelist", "app", "--noupdate")
+        self.assert_ok(result)
+        self.assertIn("old.exe", result.stdout)
+        result = self.run_cli("filelist", "app", "--refresh")
+        self.assert_ok(result)
+        self.assertIn("new.exe", result.stdout)
+
+    def test_dependency_state_reports_and_hypothetical_picks(self):
+        self.package("app", "liba")
+        self.package("liba")
+        self.package("orphan")
+        self.assert_ok(self.run_install("app", "orphan"))
+        self.assert_ok(self.run_cli("mark-auto", "orphan"))
+        before = self.db.read_bytes()
+        self.assertEqual(self.run_cli("list-desired-packages").stdout.splitlines(), ["app"])
+        self.assertEqual(self.run_cli("list-required-packages").stdout.splitlines(), ["app", "liba"])
+        self.assertEqual(self.run_cli("list-orphaned-packages").stdout.splitlines(), ["orphan"])
+        result = self.run_cli("list-required-packages", "+orphan")
+        self.assert_ok(result)
+        self.assertIn("orphan", result.stdout)
+        self.assertEqual(self.run_cli("list-required-packages", "--", "-app").stdout, "")
+        self.assertEqual(self.db.read_bytes(), before)
+        self.db.write_text("\n".join(row for row in self.db.read_text().splitlines() if not row.startswith("liba ")) + "\n")
+        self.assertEqual(self.run_cli("list-lacked-packages").stdout.splitlines(), ["liba"])
+        result = self.run_cli("list-overages-and-shortages-of-packages", "--no-header")
+        self.assert_ok(result)
+        self.assertIn("\tliba", result.stdout)
+        self.assertNotIn("installed-only", result.stdout)
+
+    def test_browser_shortcuts_use_safe_literal_urls(self):
+        self.package("app")
+        web = self.install_web_downloader()
+        (web / "summary").write_text('<span>source package</span><a href="app.html">app</a>\n')
+        (web / "source-summary").write_text('<span>homepage</span><a href="https://example.invalid/app?x=1&amp;y=2">site</a>\n')
+        result = self.run_cli("browse-homepage", "app", "--simulate")
+        self.assert_ok(result)
+        self.assertIn("https://example.invalid/app?x=1&y=2", result.stdout)
+        self.mock_downloader("cygstart", 'printf "%s\\n" "$@" > "$APT_CYG_ROOT/browser.args"')
+        self.assert_ok(self.run_cli("browse-summary", "app"))
+        self.assertIn("https://cygwin.com/packages/summary/app.html", (self.root / "browser.args").read_text())
+        (web / "source-summary").write_text('<span>homepage</span><a href="javascript:alert(1)">bad</a>\n')
+        self.assertNotEqual(self.run_cli("browse-homepage", "app", "--refresh").returncode, 0)
+
+    def test_proxy_and_configuration_compatibility_queries(self):
+        self.package("app", extra="category: Text Tools")
+        self.assert_ok(self.run_cli("set-mirror", self.mirror_url, "https://second.invalid/cygwin"))
+        values = self.run_cli("setuprc-get", "last-mirror").stdout.splitlines()
+        self.assertEqual(values, [self.mirror_url, "https://second.invalid/cygwin"])
+        result = self.run_cli("pathof", "mirror", "--mirror-index", "1")
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.strip(), "https://second.invalid/cygwin")
+        self.assertNotEqual(self.run_cli("pathof", "mirror", "--mirror-index", "9").returncode, 0)
+        self.assertIn("Text\tapp", self.run_cli("ls-pkg-with-category").stdout)
+        proxy = "http://user:p'a$ss@proxy.invalid:8080"
+        result = self.run_cli("get-proxy", "--proxy", proxy)
+        self.assert_ok(result)
+        recovered = subprocess.check_output(["bash", "-c", result.stdout + '\nprintf "%s" "$https_proxy"'], text=True)
+        self.assertEqual(recovered, proxy)
+
+    def test_legacy_hash_algorithms_are_checked(self):
+        for algorithm in ("sha1", "sha224", "sha384"):
+            with self.subTest(algorithm=algorithm):
+                name = "app-" + algorithm
+                archive = self.package(name)
+                original = hashlib.sha512(archive.read_bytes()).hexdigest()
+                expected = hashlib.new(algorithm, archive.read_bytes()).hexdigest()
+                self.metadata[-1] = self.metadata[-1].replace(original, expected)
+                self.assert_ok(self.run_install(name))
+
+    def test_public_call_and_time_preserve_validation_and_simulation(self):
+        self.package("app")
+        result = self.run_cli("call", "apt-cyg-install", "app", "--simulate")
+        self.assert_ok(result)
+        self.assertEqual(self.flags(), {})
+        self.assert_ok(self.run_cli("call", "install", "app", "--yes"))
+        self.assert_installed("app")
+        result = self.run_cli("time", "list")
+        self.assert_ok(result)
+        self.assertIn("real ", result.stderr)
+        self.assertNotEqual(self.run_cli("call", "cleanup").returncode, 0)
+        self.assertNotEqual(self.run_cli("call", "install", "../bad").returncode, 0)
+        self.assertEqual(self.run_cli("install", "app", "--completion-get-subcommand").stdout.strip(), "install")
+
+    def test_mark_aliases_and_completion_opt_out(self):
+        self.package("app", "liba")
+        self.package("liba")
+        self.assert_ok(self.run_install("app"))
+        self.assertEqual(self.run_cli("mark-showauto").stdout.strip(), "liba")
+        self.assertEqual(self.run_cli("mark-showmanual").stdout.strip(), "app")
+        self.assert_ok(self.run_cli("completion-install", "--completion-disable-autoupdate"))
+        marker = self.setup / "apt-cyg-completion.no-autoupdate"
+        self.assertTrue(marker.exists())
+        self.assert_ok(self.run_cli("completion-install"))
+        self.assertFalse(marker.exists())
+
+    def test_self_update_refreshes_completion_and_honors_opt_out(self):
+        self.assert_ok(self.run_cli("completion-install"))
+        completion = self.root / "etc/bash_completion.d/apt-cyg"
+        original_completion = completion.read_bytes()
+        before = self.executable.read_bytes()
+        candidate = self.root / "update.fixture"
+        candidate.write_text('#!/bin/bash\nif [[ $1 == completion ]]; then echo "# refreshed completion"; fi\n')
+        self.mock_downloader("wget", 'while (( $# )); do if [[ $1 == -O ]]; then out=$2; shift; fi; shift; done\ncp "$UPDATE_FIXTURE" "$out"')
+        env = dict(self.env, APT_CYG_DOWNLOADER="wget", UPDATE_FIXTURE=str(candidate))
+        self.assert_ok(self.run_cli("self-update", env=env))
+        self.assertEqual(completion.read_text().strip(), "# refreshed completion")
+        self.assertEqual(Path(str(completion) + ".bak").read_bytes(), original_completion)
+        self.executable.write_bytes(before)
+        self.assert_ok(self.run_cli("completion-install", "--completion-disable-autoupdate"))
+        original_completion = completion.read_bytes()
+        self.assert_ok(self.run_cli("self-update", env=env))
+        self.assertEqual(completion.read_bytes(), original_completion)
+
+    def test_transport_options_and_tls_required_self_update(self):
+        self.package("app")
+        self.mock_downloader("wget", '''printf '%s\\n' "$@" > "$APT_CYG_ROOT/downloader.args"
+while (( $# )); do if [[ $1 == -O ]]; then out=$2; shift; fi; shift; done
+printf sample > "$out"''')
+        env = dict(self.env, APT_CYG_DOWNLOADER="wget")
+        self.assert_ok(self.run_cli("benchmark-mirrors", "https://fixture.invalid", "--ipv4", "--no-check-certificate", "--benchmark-timeout", "7", env=env))
+        args = (self.root / "downloader.args").read_text()
+        self.assertIn("-4", args)
+        self.assertIn("--no-check-certificate", args)
+        self.assertIn("--timeout=7", args)
+        self.assertNotEqual(self.run_cli("self-update", "--no-check-certificate", env=env).returncode, 0)
+        self.assertNotEqual(self.run_cli("setup", "--no-update-setup").returncode, 0)
+
+    def serve_metadata(self):
+        import http.server
+        import threading
+        mirror = self.mirror
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(handler, *args, **kwargs):
+                super().__init__(*args, directory=str(mirror), **kwargs)
+            def log_message(handler, *args):
+                pass
+            def do_GET(handler):
+                tag = handler.headers.get("If-None-Match")
+                handler.server.seen.append((handler.path, tag))
+                if handler.path.endswith("/setup.xz") and tag == handler.server.etag:
+                    handler.send_response(304)
+                    handler.send_header("ETag", handler.server.etag)
+                    handler.end_headers()
+                else:
+                    super().do_GET()
+            def end_headers(handler):
+                if handler.path.endswith("/setup.xz"):
+                    handler.send_header("ETag", handler.server.etag)
+                super().end_headers()
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.etag = '"fixture-v1"'
+        server.seen = []
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}"
+        (self.setup / "setup.rc").write_text(f"last-cache\n\t{self.cache}\nlast-mirror\n\t{url}\n")
+        workspace = self.cache / url.replace("/", "%2f").replace(":", "%3a") / "x86_64"
+        return server, workspace
+
+    def test_conditional_http_metadata_reuses_verified_body_with_wget_and_curl(self):
+        self.package("app")
+        self.publish_mirror_metadata()
+        server, workspace = self.serve_metadata()
+        for client in ("wget", "curl"):
+            with self.subTest(client=client):
+                env = dict(self.env, APT_CYG_DOWNLOADER=client)
+                self.assert_ok(self.run_cli("update", "--proxy", "none", metadata=False, env=env))
+                self.assert_ok(self.run_cli("listall", "app", metadata=False, env=env))
+                stamp = (workspace / "setup.idx").stat().st_mtime_ns
+                self.assert_ok(self.run_cli("update", "--proxy", "none", metadata=False, env=env))
+                metadata_requests = [tag for path, tag in server.seen if path.endswith("/setup.xz")]
+                self.assertEqual(metadata_requests[-1], server.etag)
+                self.assertEqual((workspace / "setup.idx").stat().st_mtime_ns, stamp)
+        (workspace / "setup.xz").write_bytes(b"corrupted cache")
+        self.assert_ok(self.run_cli("update", "--proxy", "none", metadata=False))
+        self.assertIsNone([tag for path, tag in server.seen if path.endswith("/setup.xz")][-1])
+
+    def test_no_update_refuses_invalid_cache_without_fetching(self):
+        self.package("app")
+        self.write_metadata()
+        (self.workspace / "setup.signed.ini").write_bytes(b"corrupt")
+        result = self.run_cli("install", "app", "--noupdate", metadata=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--noupdate", result.stderr)
+        self.assertEqual(self.flags(), {})
+
+    def test_web_lookup_handles_architecture_suffix_and_source_package_link(self):
+        archive = self.package("app")
+        renamed = archive.with_name(archive.name.replace(".tar.xz", "-x86_64.tar.xz"))
+        archive.rename(renamed)
+        self.metadata[-1] = self.metadata[-1].replace(archive.name, renamed.name)
+        web = self.install_web_downloader()
+        (web / "filelist").write_text('<pre>\n2026-01-01 12:00 10 usr/bin/example.exe\n</pre>\n')
+        (web / "query").write_text("Found 1 matches\napp-1.0-1 Fixture\n")
+        (web / "summary").write_text('<span>source package</span><a href="app-src.html">app</a>\n')
+        (web / "source-summary").write_text('<span>homepage</span><a href="https://example.invalid/app">site</a>\n')
+        self.assertIn("example.exe", self.run_cli("filelist", "app").stdout)
+        self.assertIn("example.exe", self.run_cli("filesearch", "example").stdout)
+        result = self.run_cli("browse-homepage", "app", "--simulate")
+        self.assert_ok(result)
+        self.assertIn("https://example.invalid/app", result.stdout)
+
+    def test_conditional_metadata_still_rejects_bad_signature(self):
+        self.package("app")
+        path = self.publish_mirror_metadata()
+        server, workspace = self.serve_metadata()
+        self.assert_ok(self.run_cli("update", "--proxy", "none", metadata=False))
+        previous = (workspace / "setup.ini").read_bytes()
+        Path(str(path) + ".sig").write_bytes(b"invalid signature")
+        result = self.run_cli("update", "--proxy", "none", metadata=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((workspace / "setup.ini").read_bytes(), previous)
+        self.assertEqual([tag for request, tag in server.seen if request.endswith("/setup.xz")][-1], server.etag)
+
+    def test_acl_backup_failure_prevents_all_permission_changes(self):
+        first = self.root / "first"
+        second = self.root / "second"
+        for target in (first, second):
+            target.write_text("data")
+            target.chmod(0o400)
+        self.mock_downloader("getfacl", '[[ $2 != */second ]] || exit 1\nprintf "user::r--\\n"')
+        result = self.run_cli("repair-acl", str(first), str(second), "--yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(first.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(second.stat().st_mode & 0o777, 0o400)
+
+    def test_web_ttl_uses_fetch_time_instead_of_remote_timestamp(self):
+        self.package("app")
+        web = self.install_web_downloader()
+        page = web / "filelist"
+        page.write_text('<pre>\n2026-01-01 12:00 1 usr/bin/app.exe\n</pre>\n')
+        os.utime(page, (1, 1))
+        downloader = self.root / "bin/wget"
+        downloader.write_text(downloader.read_text().replace('cp "$APT_CYG_ROOT/web/', 'cp -p "$APT_CYG_ROOT/web/'))
+        self.assert_ok(self.run_cli("filelist", "app"))
+        count = len((self.root / "web.requests").read_text().splitlines())
+        self.assert_ok(self.run_cli("filelist", "app"))
+        self.assertEqual(len((self.root / "web.requests").read_text().splitlines()), count)
+
+    def test_explicit_install_as_automatic_and_help_alias(self):
+        self.package("app")
+        self.assert_ok(self.run_cli("install", "app", "--no-user-picked"))
+        self.assertEqual(self.flags()["app"], "0")
+        self.assert_ok(self.run_cli("call", "install", "app", "--no-user-picked"))
+        self.assertEqual(self.flags()["app"], "0")
+        result = self.run_cli("help")
+        self.assert_ok(result)
+        self.assertIn("OPERATIONS", result.stdout)
+
+    def test_source_homepage_is_read_without_evaluating_cygport(self):
+        self.package("app")
+        source = self.mirror_cache / "x86_64/release/app/app-1.0-1-src.tar.xz"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(source, "w:xz") as tar:
+            content = b'HOMEPAGE="https://example.invalid/app"\ntouch "$APT_CYG_ROOT/should-not-run"\n'
+            entry = tarfile.TarInfo("app.cygport")
+            entry.size = len(content)
+            tar.addfile(entry, io.BytesIO(content))
+        relative = source.relative_to(self.mirror_cache).as_posix()
+        self.metadata[-1] += f"source: {relative} {source.stat().st_size} {hashlib.sha512(source.read_bytes()).hexdigest()}\n"
+        result = self.run_cli("browse-homepage-with-mirror-source", "app", "--simulate")
+        self.assert_ok(result)
+        self.assertIn("https://example.invalid/app", result.stdout)
+        self.assertFalse((self.root / "should-not-run").exists())
+
+    def test_deleted_last_key_can_be_explicitly_added_back(self):
+        keyring = self.setup / "empty.gpg"
+        keyring.write_bytes(b"")
+        env = dict(self.env, APT_CYG_KEYRING=str(keyring))
+        self.assert_ok(self.run_cli("key-add", str(self.keyring), env=env))
+        self.package("app")
+        self.assert_ok(self.run_cli("install", "app", env=env))
+        self.assert_installed("app")
+
+    def test_dependency_report_refuses_to_guess_alternative_requirements(self):
+        self.package("app")
+        self.assert_ok(self.run_install("app"))
+        (self.setup / "app.deps").unlink()
+        self.metadata = []
+        self.package("app", "liba | libb")
+        self.package("liba")
+        self.package("libb")
+        before = self.db.read_bytes()
+        result = self.run_cli("list-required-packages")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("alternative dependencies", result.stderr)
+        self.assertEqual(self.run_cli("list-desired-packages").stdout.strip(), "app")
+        self.assertEqual(self.db.read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()
