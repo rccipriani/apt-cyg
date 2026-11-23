@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y gawk gnupg shellcheck xz-utils zstd
+        run: sudo apt-get update && sudo apt-get install -y gawk gnupg shellcheck xz-utils zstd zsh python3-pexpect
       - name: Check Bash syntax and errors
         run: |
           bash -n apt-cyg
